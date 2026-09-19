@@ -1,0 +1,30 @@
+{% extends "base.html" %}
+{% block title %}Ustawienia — Video-to-Doc{% endblock %}
+{% block content %}
+<h2>Ustawienia domyślne</h2>
+<form method="post" action="/settings" class="form">
+  <label><input type="checkbox" name="enrich" value="1" {% if settings.enrich %}checked{% endif %}> Wzbogacenie LLM (enrich) domyślnie włączone</label>
+  <label>Model enrich:<br>
+    <select name="enrich_model">
+      {% for m in models %}
+      <option value="{{ m }}" {% if settings.enrich_model==m %}selected{% endif %}>{{ m }}</option>
+      {% endfor %}
+    </select>
+  </label>
+  <label>Scene threshold:<br><input type="number" step="0.01" name="scene_threshold" value="{{ settings.scene_threshold }}"></label>
+  <label>Track:<br>
+    <select name="track">
+      <option value="mic" {% if settings.track=="mic" %}selected{% endif %}>mic</option>
+      <option value="mix" {% if settings.track=="mix" %}selected{% endif %}>mix</option>
+      <option value="meeting" {% if settings.track=="meeting" %}selected{% endif %}>meeting</option>
+    </select>
+  </label>
+  <label><input type="checkbox" name="frame_qa" value="1" {% if settings.frame_qa %}checked{% endif %}> Kontrola czytelności klatek (frame_qa)</label>
+  <label><input type="checkbox" name="annotate" value="1" {% if settings.annotate %}checked{% endif %}> Adnotacje graficzne (deterministyczne)</label>
+  <label><input type="checkbox" name="nano_banana" value="1" {% if settings.nano_banana %}checked{% endif %}> Nano Banana 2 — adnotacje AI na obrazie (Gemini, ~$0,04/zrzut)</label>
+  <label>Autor (default):<br><input type="text" name="author" value="{{ settings.author }}"></label>
+  <button type="submit" class="btn btn-primary">Zapisz</button>
+  <a href="/" class="btn">Anuluj</a>
+</form>
+<p><small>Zapisywane w <code>settings.json</code>. Lista modeli stała: artur-daily, erp-code, deepseek-v4-pro, glm-5.2</small></p>
+{% endblock %}

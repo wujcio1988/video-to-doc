@@ -1,0 +1,60 @@
+{% extends "base.html" %}
+{% block title %}Wyniki #{{ task.id }} — Video-to-Doc{% endblock %}
+{% block content %}
+<h2>Wyniki zadania #{{ task.id }} — {{ task.video_name }}</h2>
+<p><strong>DRAFT — nie wysyłaj do klienta bez edycji.</strong> Output: <code>{{ output_dir }}</code></p>
+<p>
+  <a class="btn" href="/tasks/{{ task.id }}">Szczegóły zadania</a>
+  <a class="btn btn-primary" href="/tasks/{{ task.id }}/download">Pobierz ZIP client-ready</a>
+  <a class="btn" href="/tasks/{{ task.id }}/log">Log</a>
+</p>
+
+{% if metadata_json %}
+<details open>
+  <summary><strong>metadata.json</strong></summary>
+  <pre>{{ metadata_json | tojson(indent=2) }}</pre>
+</details>
+{% endif %}
+
+<h3>INSTRUKCJA.md</h3>
+{% if instrukcja_html %}
+<div class="md-preview">{{ instrukcja_html | safe }}</div>
+{% else %}
+<p><em>Brak INSTRUKCJA.md (zadanie nie ukończone lub błąd).</em></p>
+{% endif %}
+
+<h3>TRANSKRYPCJA.md</h3>
+{% if transkrypcja_html %}
+<div class="md-preview">{{ transkrypcja_html | safe }}</div>
+{% else %}
+<p><em>Brak TRANSKRYPCJA.md</em></p>
+{% endif %}
+
+<h3>COMPLETENESS_REPORT.md</h3>
+{% if completeness_html %}
+<div class="md-preview">{{ completeness_html | safe }}</div>
+{% else %}
+<p><em>Brak COMPLETENESS_REPORT.md</em></p>
+{% endif %}
+
+<h3>Pliki client-ready</h3>
+{% if client_ready_files %}
+<table class="table">
+  <tr><th>Plik</th><th>Rozmiar</th></tr>
+  {% for f in client_ready_files %}
+  <tr><td><code>{{ f.name }}</code></td><td>{{ f.size_kb }} KB</td></tr>
+  {% endfor %}
+</table>
+{% else %}
+<p><em>Brak plików client-ready lub katalog pusty.</em></p>
+{% endif %}
+
+{% if files_info %}
+<h4>Główne artefakty</h4>
+<ul>
+{% for f in files_info %}
+  <li><code>{{ f.name }}</code> — {{ f.size }} B</li>
+{% endfor %}
+</ul>
+{% endif %}
+{% endblock %}

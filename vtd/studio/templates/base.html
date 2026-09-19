@@ -1,0 +1,33 @@
+<!DOCTYPE html>
+<html lang="pl">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>{% block title %}Video-to-Doc Studio{% endblock %}</title>
+  <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+<header class="header">
+  <div class="container">
+    <h1>Video-to-Doc Studio</h1>
+    <span class="badge">DRAFT — bez auto-wysyłki</span>
+    <nav>
+      <a href="/">Dashboard</a>
+      <a href="/settings">Ustawienia</a>
+    </nav>
+  </div>
+</header>
+<main class="container">
+  <div class="draft-warning">
+    <strong>DRAFT — nie wysyłaj do klienta bez edycji.</strong> Wszystkie dokumenty generowane są jako szkice do ręcznej weryfikacji. Aplikacja nigdy nie wysyła nic automatycznie (brak Telegrama, brak sieci poza localhost).
+  </div>
+  {% block content %}{% endblock %}
+</main>
+<footer class="footer">
+  <div class="container">
+    <small>Video-to-Doc Studio · lokalna nakładka na pipeline video_to_manual · Port 9870 · Bind 127.0.0.1</small>
+  </div>
+</footer>
+{% block scripts %}{% endblock %}
+</body>
+</html>

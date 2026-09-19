@@ -1,0 +1,90 @@
+{% extends "base.html" %}
+{% block title %}Zadanie #{{ task.id }} — Video-to-Doc{% endblock %}
+{% block content %}
+<h2>Zadanie #{{ task.id }} — {{ task.video_name }}</h2>
+<table class="table">
+  <tr><th>Video</th><td><code>{{ task.video_path }}</code></td></tr>
+  <tr><th>Tryb</th><td>{{ task.mode }}</td></tr>
+  <tr><th>Klient</th><td>{{ task.client or "—" }}</td></tr>
+  <tr><th>Proces / Moduł / Env</th><td>{{ task.process or "—" }} / {{ task.module or "—" }} / {{ task.environment or "—" }}</td></tr>
+  <tr><th>Autor</th><td>{{ task.author or "—" }}</td></tr>
+  <tr><th>Status</th><td><span class="status {{ task.status }}">{{ task.status }}</span></td></tr>
+  <tr><th>Stage</th><td id="stage">{{ task.stage }}</td></tr>
+  <tr><th>Postęp</th><td id="progress">{{ task.progress_note or "—" }}</td></tr>
+  <tr><th>Output dir</th><td><code>{{ task.output_dir }}</code></td></tr>
+  <tr><th>Log</th><td><code>{{ task.log_path }}</code> — <a href="/tasks/{{ task.id }}/log" target="_blank">pełny log</a></td></tr>
+  {% if task.error_tail %}<tr><th>Błąd (ostatnie 40 linii)</th><td><pre>{{ task.error_tail }}</pre></td></tr>{% endif %}
+</table>
+
+<div class="progress-bar">
+  <div id="bar" class="bar" style="width: {% if task.status=='done' %}100{% elif task.status=='running' %}50{% elif task.status=='queued' %}10{% else %}100{% endif %}%">
+    {{ task.stage }}
+  </div>
+</div>
+
+{% if task.status == "running" or task.status == "queued" %}
+<p><em>Automatyczne odświeżanie co 2s…</em></p>
+{% endif %}
+
+{% if task.status == "done" %}
+<p>
+  <a class="btn btn-primary" href="/tasks/{{ task.id }}/results">Zobacz wyniki (podgląd MD)</a>
+  <a class="btn" href="/tasks/{{ task.id }}/download">Pobierz ZIP client-ready</a>
+</p>
+{% endif %}
+
+<pre id="log-tail" style="max-height:300px; overflow:auto; background:#f5f5f5; padding:0.5em;">Ładowanie logu…</pre>
+
+<p><a href="/">« Powrót do dashboardu</a></p>
+{% endblock %}
+{% block scripts %}
+<script>
+const taskId = {{ task.id }};
+let status = "{{ task.status }}";
+function poll() {
+  fetch(`/tasks/${taskId}/json`)
+    .then(r=>r.json())
+    .then(data=>{
+      document.getElementById('stage').textContent = data.stage || '—';
+      document.getElementById('progress').textContent = data.progress_note || '—';
+      status = data.status;
+      const bar = document.getElementById('bar');
+      if (bar) {
+        bar.textContent = data.stage;
+        if (data.status === 'done') bar.style.width='100%';
+        else if (data.status === 'running') bar.style.width='60%';
+        else if (data.status === 'queued') bar.style.width='10%';
+        else bar.style.width='100%';
+      }
+      // fetch log tail
+      fetch(`/tasks/${taskId}/log`).then(r=>r.text()).then(txt=>{
+        const el = document.getElementById('log-tail');
+        if (el) {
+          const lines = txt.split('\n');
+          el.textContent = lines.slice(-80).join('\n');
+        }
+      }).catch(()=>{});
+      if (data.status === 'running' || data.status === 'queued') {
+        setTimeout(poll, 2000);
+      } else {
+        // final refresh
+        if (data.status === 'done' && !location.href.includes('results')) {
+          // show link
+        }
+      }
+    }).catch(()=>{ if (status==='running' || status==='queued') setTimeout(poll, 2000); });
+}
+if (status === 'running' || status === 'queued') {
+  setTimeout(poll, 2000);
+  // initial log load
+  fetch(`/tasks/${taskId}/log`).then(r=>r.text()).then(txt=>{
+    document.getElementById('log-tail').textContent = txt.split('\n').slice(-80).join('\n');
+  });
+} else {
+  fetch(`/tasks/${taskId}/log`).then(r=>r.text()).then(txt=>{
+    const el=document.getElementById('log-tail');
+    if (el) el.textContent = txt.split('\n').slice(-60).join('\n');
+  });
+}
+</script>
+{% endblock %}

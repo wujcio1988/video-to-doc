@@ -1,0 +1,42 @@
+# Video-to-Doc (VTD) Configuration
+
+llm:
+  # Provider: openai, openrouter, ollama, custom, omniroute
+  provider: "openai"
+  # Standard OpenAI-compatible base URL:
+  # - OpenAI: https://api.openai.com/v1
+  # - OpenRouter: https://openrouter.ai/api/v1
+  # - Ollama (local): http://localhost:11434/v1
+  # - LM Studio: http://localhost:1234/v1
+  base_url: "https://api.openai.com/v1"
+  # Environment variable name holding the API key
+  api_key_env: "OPENAI_API_KEY"
+  timeout: 60.0
+  max_retries: 3
+  
+  # Role-specific model mappings:
+  enricher_model: "gpt-4o-mini"
+  frame_qa_model: "gpt-4o-mini"
+  element_locator_model: "gpt-4o-mini"
+  qa_verifier_model: "gpt-4o-mini"
+
+storage:
+  recordings_dir: "./recordings"
+  output_dir: "./output"
+  data_dir: "./data"
+  reference_docs_dir: null
+
+server:
+  host: "127.0.0.1"
+  port: 9870
+
+pipeline:
+  whisper_model: "large-v3"
+  whisper_language: "pl"
+  whisper_device: "cpu"         # "cuda" or "cpu"
+  whisper_compute_type: "int8"   # "float16" for GPU, "int8" for CPU
+  scene_threshold: 0.05
+  phash_threshold: 8
+  scale_width: 1600
+  max_step_seconds: 45.0
+  grid_interval: 30.0

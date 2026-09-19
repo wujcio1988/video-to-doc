@@ -1,0 +1,61 @@
+{% extends "base.html" %}
+{% block title %}Dashboard — Video-to-Doc Studio{% endblock %}
+{% block content %}
+<h2>Biblioteka nagrań</h2>
+<p>Nagrania z katalogu <code>~/erp-workspace/recordings/</code> (mkv/mp4). Pliki trafiają tu przez Syncthing z L1.</p>
+{% if recordings %}
+<table class="table">
+  <thead>
+    <tr><th>Nazwa</th><th>Rozmiar</th><th>Data</th><th>Status</th><th>Akcja</th></tr>
+  </thead>
+  <tbody>
+    {% for r in recordings %}
+    <tr>
+      <td><code>{{ r.name }}</code><br><small>{{ r.path }}</small></td>
+      <td>{{ r.size_mb }} MB</td>
+      <td>{{ r.mtime }}</td>
+      <td>{% if r.processed %}<span class="badge-ok">przetworzony</span>{% else %}<span class="badge-new">nowy</span>{% endif %}</td>
+      <td><a class="btn" href="/new?video={{ r.path|urlencode }}">Nowe zadanie</a></td>
+    </tr>
+    {% endfor %}
+  </tbody>
+</table>
+{% else %}
+<p><em>Brak plików video w recordings/. Sprawdź, czy Syncthing zsynchronizował nagrania.</em></p>
+{% endif %}
+
+<h2>Zadania</h2>
+{% if tasks %}
+<table class="table">
+  <thead>
+    <tr><th>ID</th><th>Video</th><th>Tryb</th><th>Klient</th><th>Status</th><th>Stage</th><th>Utworzono</th><th>Akcje</th></tr>
+  </thead>
+  <tbody>
+    {% for t in tasks %}
+    <tr>
+      <td>{{ t.id }}</td>
+      <td><small>{{ t.video_name }}</small></td>
+      <td>{{ t.mode }}</td>
+      <td>{{ t.client or "—" }}</td>
+      <td>
+        {% if t.status == "queued" %}<span class="status queued">queued</span>
+        {% elif t.status == "running" %}<span class="status running">running</span>
+        {% elif t.status == "done" %}<span class="status done">done</span>
+        {% elif t.status == "error" %}<span class="status error">error</span>
+        {% else %}{{ t.status }}{% endif %}
+      </td>
+      <td>{{ t.stage or "—" }}</td>
+      <td><small>{{ t.created_at[:19] }}</small></td>
+      <td>
+        <a href="/tasks/{{ t.id }}">Szczegóły</a>
+        {% if t.status == "done" %} | <a href="/tasks/{{ t.id }}/results">Wyniki</a> | <a href="/tasks/{{ t.id }}/download">ZIP</a>{% endif %}
+        | <a href="/tasks/{{ t.id }}/log">Log</a>
+      </td>
+    </tr>
+    {% endfor %}
+  </tbody>
+</table>
+{% else %}
+<p><em>Brak zadań. Wybierz plik z biblioteki i utwórz nowe zadanie.</em></p>
+{% endif %}
+{% endblock %}

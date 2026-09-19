@@ -1,0 +1,58 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "video-to-doc"
+version = "0.1.0"
+description = "Autonomous pipeline & studio converting screen recordings into structured step-by-step technical documentation, manuals, and meeting summaries."
+readme = "README.md"
+license = { text = "MIT" }
+authors = [
+    { name = "Artur Kozłowski", email = "arturkozlowski1988@users.noreply.github.com" }
+]
+requires-python = ">=3.10"
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Information Technology",
+    "License :: OSI Approved :: MIT License",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.10",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Topic :: Documentation",
+    "Topic :: Multimedia :: Video",
+]
+dependencies = [
+    "pydantic>=2.0.0",
+    "pillow>=10.0.0",
+    "imagehash>=4.3.1",
+    "python-docx>=0.8.11",
+    "faster-whisper>=1.0.0",
+    "fastapi>=0.100.0",
+    "uvicorn>=0.20.0",
+    "jinja2>=3.1.0",
+    "python-multipart>=0.0.6",
+    "markdown>=3.4.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=7.0.0",
+    "httpx>=0.24.0",
+    "pyyaml>=6.0.0",
+]
+
+[project.scripts]
+vtd = "vtd.cli:main"
+vtd-studio = "vtd.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["vtd*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+python_functions = ["test_*"]
