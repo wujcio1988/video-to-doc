@@ -1,0 +1,18 @@
+services:
+  video-to-doc:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: ghcr.io/wujcio1988/video-to-doc:latest
+    container_name: video-to-doc-studio
+    restart: unless-stopped
+    ports:
+      - "9870:9870"
+    environment:
+      - OPENAI_API_KEY=${OPENAI_API_KEY:-}
+      - OPENROUTER_API_KEY=${OPENROUTER_API_KEY:-}
+    volumes:
+      - ./recordings:/app/recordings
+      - ./output:/app/output
+      - ./data:/app/data
+      - ./config.yaml:/app/config.yaml:ro

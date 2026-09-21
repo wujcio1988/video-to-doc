@@ -65,9 +65,42 @@
 
 ---
 
-## 📋 System Prerequisites
+## 🐳 Quick Start with Docker (Recommended)
 
-VTD relies on system-level multimedia tools:
+The easiest way to run Video-to-Doc without installing system packages (`ffmpeg`, `tesseract`, Python venvs) manually is via Docker:
+
+### 1. Using Docker Compose (One-Click)
+
+```bash
+# Clone the repository
+git clone https://github.com/wujcio1988/video-to-doc.git
+cd video-to-doc
+
+# Set your API key in .env or config.yaml
+echo "OPENAI_API_KEY=your_key_here" > .env
+
+# Start the Studio in the background
+docker compose up -d
+```
+
+Open `http://127.0.0.1:9870/` in your browser.
+
+### 2. Using Docker CLI Directly
+
+```bash
+docker run -d \
+  --name video-to-doc \
+  -p 9870:9870 \
+  -v $(pwd)/recordings:/app/recordings \
+  -v $(pwd)/output:/app/output \
+  -v $(pwd)/data:/app/data \
+  -e OPENAI_API_KEY=your_key_here \
+  ghcr.io/wujcio1988/video-to-doc:latest
+```
+
+---
+
+## 📋 System Prerequisites (Manual / Non-Docker)
 
 1. **FFmpeg** (with `ffprobe`) — for audio extraction and scene detection.
 2. **Tesseract OCR** — for text detection and coordinate mapping.

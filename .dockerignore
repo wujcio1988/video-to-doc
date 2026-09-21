@@ -1,0 +1,17 @@
+__pycache__/
+*.py[cod]
+*$py.class
+.git/
+.gitignore
+.pytest_cache/
+.venv/
+env/
+venv/
+data/
+output/
+recordings/
+tests/
+*.log
+*.mkv
+*.mp4
+*.bak*
