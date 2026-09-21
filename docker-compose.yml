@@ -8,11 +8,15 @@ services:
     restart: unless-stopped
     ports:
       - "9870:9870"
+    env_file:
+      - .env
     environment:
+      # Zmienne mogą być nadpisane w pliku .env lub tutaj
       - OPENAI_API_KEY=${OPENAI_API_KEY:-}
+      - OPENAI_BASE_URL=${OPENAI_BASE_URL:-https://api.openai.com/v1}
+      - OPENAI_MODEL=${OPENAI_MODEL:-}
       - OPENROUTER_API_KEY=${OPENROUTER_API_KEY:-}
     volumes:
       - ./recordings:/app/recordings
       - ./output:/app/output
       - ./data:/app/data
-      - ./config.yaml:/app/config.yaml:ro

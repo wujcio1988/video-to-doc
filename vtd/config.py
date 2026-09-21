@@ -173,4 +173,42 @@ def load_config(config_path: Optional[Path] = None) -> AppConfig:
             except Exception:
                 pass
 
-    return AppConfig(**cfg_dict)
+    cfg = AppConfig(**cfg_dict)
+
+    # Bezpośrednie nadpisywanie ze zmiennych środowiskowych (kluczowe dla Dockera)
+    base_url_env = os.environ.get("OPENAI_BASE_URL") or os.environ.get("OPENAI_API_BASE") or os.environ.get("VTD_BASE_URL")
+    if base_url_env and base_url_env.strip():
+        cfg.llm.base_url = base_url_env.strip()
+
+    api_key_env = os.environ.get("OPENAI_API_KEY") or os.environ.get("VTD_API_KEY")
+    if api_key_env and api_key_env.strip():
+        cfg.llm.api_key = api_key_env.strip()
+
+    model_env = os.environ.get("OPENAI_MODEL") or os.environ.get("VTD_MODEL")
+    if model_env and model_env.strip():
+        m = model_env.strip()
+        cfg.llm.enricher_model = m
+        cfg.llm.frame_qa_model = m
+        cfg.llm.element_locator_model = m
+        cfg.llm.qa_verifier_model = m
+
+    port_env = os.environ.get("PORT") or os.environ.get("VTD_PORT")
+    if port_env and port_env.strip():
+        try:
+            cfg.server.port = int(port_env.strip())
+        except ValueError:
+            pass
+
+    host_env = os.environ.get("HOST") or os.environ.get("VTD_HOST")
+    if host_env and host_env.strip():
+        cfg.server.host = host_env.strip()
+
+    rec_dir = os.environ.get("RECORDINGS_DIR") or os.environ.get("VTD_RECORDINGS_DIR")
+    if rec_dir and rec_dir.strip():
+        cfg.storage.recordings_dir = Path(rec_dir.strip())
+
+    out_dir = os.environ.get("OUTPUT_DIR") or os.environ.get("VTD_OUTPUT_DIR")
+    if out_dir and out_dir.strip():
+        cfg.storage.output_dir = Path(out_dir.strip())
+
+    return cfg

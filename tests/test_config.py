@@ -41,3 +41,17 @@ def test_load_config_from_json(tmp_path):
     assert loaded.llm.base_url == "https://openrouter.ai/api/v1"
     assert loaded.llm.enricher_model == "deepseek/deepseek-chat"
     assert loaded.server.port == 8080
+
+
+def test_env_overrides(monkeypatch):
+    monkeypatch.setenv("OPENAI_BASE_URL", "http://my-custom-proxy/v1")
+    monkeypatch.setenv("OPENAI_API_KEY", "env-secret-xyz")
+    monkeypatch.setenv("OPENAI_MODEL", "qwen-custom:72b")
+    monkeypatch.setenv("PORT", "9900")
+
+    cfg = load_config()
+    assert cfg.llm.base_url == "http://my-custom-proxy/v1"
+    assert cfg.llm.api_key == "env-secret-xyz"
+    assert cfg.llm.enricher_model == "qwen-custom:72b"
+    assert cfg.llm.frame_qa_model == "qwen-custom:72b"
+    assert cfg.server.port == 9900
