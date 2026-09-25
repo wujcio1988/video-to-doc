@@ -48,6 +48,9 @@ data/
 *.wav
 *.bak*
 
+# Generated standalone artifacts
+vtd/tests/
+
 # IDE & OS
 .vscode/
 .idea/

@@ -6,15 +6,94 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import List, Optional, Dict, Any
 from vtd.config import PipelineConfig
-from vtd.core.audio_extractor import extract_mic_audio, detect_silence, get_audio_stream_count
-from vtd.core.transcriber import Transcriber, SpeechSegment
-from vtd.core.frame_extractor import extract_scene_frames
-from vtd.core.dedup import filter_duplicate_frames
-from vtd.core.fusion import fuse_signals_into_steps_v2, validate_steps_timestamps, fuse_signals_into_steps
-from vtd.builders.manual_builder import render_markdown_manual, build_llm_prompt, render_clean_transcript, render_docx_manual
+from vtd.audio_extractor import extract_mic_audio, detect_silence, get_audio_stream_count
+from vtd.transcriber import Transcriber, SpeechSegment, write_transcription_artifacts
+from vtd.frame_extractor import extract_scene_frames
+from vtd.dedup import filter_duplicate_frames
+from vtd.fusion import fuse_signals_into_steps_v2, validate_steps_timestamps, fuse_signals_into_steps
+from vtd.manual_builder import render_markdown_manual, build_llm_prompt, render_clean_transcript, render_docx_manual
+from vtd import stage_cache
+from vtd.enricher import ENRICH_MODEL_DEFAULT
+from vtd.manual_v2 import build_manual_v2, render_manual_v2_markdown, render_manual_v2_html, render_manual_v2_docx
+from vtd.meeting_v2 import render_meeting_markdown_v2, render_meeting_html_v2
+from vtd.video_semantic_map import SemanticVideoMapAdapter
 
 # Stała dla Track 3 neutral labeling
 SYSTEM_AUDIO_LABEL = "Desktop/system audio — niezweryfikowany rozmówca"
+
+
+def _build_manual_v2_inputs(fused_steps, enriched_data):
+    """Build MANUAL v2 candidates and provenance-bound evidence rows.
+
+    Evidence is accepted only from explicit upstream provenance.  Timestamps,
+    fusion frame paths, and step numbers are not sufficient to invent a frame
+    identity.  Missing provenance therefore produces an empty evidence row and
+    the MANUAL renderer emits PARTIAL.
+    """
+    enriched_by_number = {
+        item.get("step_number"): item
+        for item in (enriched_data or {}).get("steps", [])
+        if isinstance(item, dict) and isinstance(item.get("step_number"), int)
+    }
+    candidates = []
+    evidence_rows = []
+    for fused in fused_steps:
+        enriched = enriched_by_number.get(fused.step_number, {})
+        candidates.append({
+            "title": enriched.get("title", ""),
+            "description": enriched.get("description", ""),
+            "speech_text": fused.speech_text,
+            "start": fused.start_time,
+            "end": fused.end_time,
+            "enriched_step_id": enriched.get("enriched_step_id"),
+            "source_segment_ids": list(enriched.get("source_segment_ids") or []),
+            "frame_ids": list(enriched.get("frame_ids") or []),
+        })
+        raw_evidence = enriched.get("evidence", [])
+        if isinstance(raw_evidence, dict):
+            raw_evidence = [raw_evidence]
+        evidence_rows.append([
+            row for row in raw_evidence
+            if isinstance(row, dict)
+            and row.get("frame_id", row.get("frame_identifier"))
+            and row.get("frame_id", row.get("frame_identifier")) in (enriched.get("frame_ids") or [])
+        ])
+    return candidates, evidence_rows
+
+
+def _build_meeting_v2_input(enriched_data, fused_steps=None):
+    """Build the independent meeting.v2 contract from enriched meeting data.
+
+    Every item carries only its own source/frame evidence. Invalid or rejected
+    model output is excluded from the client-facing payload; absent provenance
+    stays absent (never a midpoint or synthetic scene id).
+    """
+    src = enriched_data if isinstance(enriched_data, dict) else {}
+    def accepted(items):
+        out = []
+        for raw in items if isinstance(items, list) else []:
+            if not isinstance(raw, dict):
+                raw = {"text": raw}
+            if str(raw.get("status", "")).lower() in {"rejected", "invalid"}:
+                continue
+            item = dict(raw)
+            ev = item.get("evidence", [])
+            if isinstance(ev, dict): ev = [ev]
+            frame_ids = set(item.get("frame_ids") or [])
+            item["evidence"] = [e for e in ev if isinstance(e, dict) and
+                                  e.get("frame_id", e.get("frame_identifier")) and
+                                  e.get("frame_id", e.get("frame_identifier")) in frame_ids]
+            out.append(item)
+        return out
+    return {
+        "title": src.get("title"), "meeting_date": src.get("meeting_date") or src.get("date"),
+        "purpose": src.get("purpose") or src.get("intro"),
+        "participants": src.get("participants", []), "topics": accepted(src.get("topics")),
+        "decisions": accepted(src.get("decisions")),
+        "agreements": accepted(src.get("agreements")), "proposed": [],
+        "action_items": accepted(src.get("action_items")),
+        "open_questions": accepted(src.get("open_questions")), "risks": accepted(src.get("risks")),
+    }
 
 
 def resolve_device_and_compute(requested_device: str) -> tuple[str, str]:
@@ -43,12 +122,17 @@ def build_parser() -> argparse.ArgumentParser:
     run_cmd.add_argument("--output", "-o", type=str, default="manual_output", help="Katalog wyjściowy")
     run_cmd.add_argument("--title", "-t", type=str, default="Instrukcja Powdrożeniowa", help="Tytuł instrukcji / spotkania")
     run_cmd.add_argument("--device", choices=["auto", "cuda", "cpu"], default="auto", help="Urządzenie dla Whisper (auto: NVIDIA CUDA/float16 jeśli dostępne, inaczej cpu: int8)")
-    run_cmd.add_argument("--model", default="large-v3", help="Model faster-whisper (np. large-v3, small)")
+    run_cmd.add_argument("--transcription-engine", choices=["local-whisper"], default="local-whisper", help="Jawny silnik transkrypcji")
+    run_cmd.add_argument("--model", default="medium", help="Model faster-whisper; tiny wyłącznie smoke")
+    run_cmd.add_argument("--diarization", action="store_true", help="Opcjonalny pyannote; etykiety SPEAKER_XX, bez zgadywania imion")
     run_cmd.add_argument("--scene-threshold", type=float, default=None, help="Próg detekcji zmian scen (domyślnie 0.35, dla ERP zalecane 0.05-0.08)")
     run_cmd.add_argument("--track", choices=["mic", "mix", "meeting", "0", "1", "2", "auto"], default="mic", help="Ścieżka audio: mic (Track 2 - mikrofon lektora), mix (Track 1 - miks), meeting (Track 2 + Track 3 - dialog; Track 3 to Desktop/system audio — niezweryfikowany rozmówca), auto (auto-detekcja najlepszego toru)")
     run_cmd.add_argument("--mode", choices=["manual", "meeting"], default="manual", help="Tryb pracy: manual (instrukcja krok po kroku), meeting (protokół spotkania — nie instrukcja)")
     run_cmd.add_argument("--enrich", action="store_true", help="Wzbogać draft przez model LLM (OmniRoute) — wynik nadal DRAFT / DO WERYFIKACJI")
-    run_cmd.add_argument("--enrich-model", default="erp-manual", help="Model LLM w OmniRoute (np. erp-manual, antigravity/gemini-3.8-flash-tiered)")
+    run_cmd.add_argument("--enrich-model", default=ENRICH_MODEL_DEFAULT, help="Bezpośredni model xKiro (vendor/model). Domyślnie google/gemini-3.8-flash; fallback anthropic/claude-sonnet-5.")
+    run_cmd.add_argument("--curate", action="store_true", help="Kuracja treści: agent wybiera kroki-operacje programu, odrzuca dyskusje/dygresje (wymaga --enrich)")
+    run_cmd.add_argument("--curate-model", default=ENRICH_MODEL_DEFAULT, help="Model kuracji na xKiro (ten sam kanał co enrich; fallback claude-sonnet-5)")
+    run_cmd.add_argument("--curate-scope", choices=["program", "program+context"], default="program", help="Zakres kuracji: program (tylko operacje w programie) lub program+context (także kontekst danych/receptur)")
     # Metadane wejściowe — manual-first
     run_cmd.add_argument("--client", type=str, default=None, help="Nazwa klienta (jeśli brak: DO UZUPEŁNIENIA; nie wyciągaj z nazwy pliku)")
     run_cmd.add_argument("--process", type=str, default=None, help="Proces biznesowy (np. Sprzedaż, Produkcja)")
@@ -66,13 +150,16 @@ def build_parser() -> argparse.ArgumentParser:
     run_cmd.add_argument("--nano-banana", action="store_true", help="Etap 4: wyostrzenie/oznaczenia klatek przez Gemini Flash Image (nano banana) z walidacją wierności OCR-diff; wynik w frames_enhanced/, odrzucone wracają do oryginału")
     run_cmd.add_argument("--nano-auto-accept", action="store_true", help="Automatyczna akceptacja wersji AI gdy walidacja OK (bez tego wymagany podgląd/akceptacja w Studio)")
     run_cmd.add_argument("--nano-mode", choices=["located", "composite"], default="located", help="Etap 5: located = AI wskazuje współrzędne (JSON), kod rysuje (default); composite = AI generuje warstwę (nano-banana-2, fallback located)")
+    run_cmd.add_argument("--no-cache", action="store_true", help="Wyłącz dysk cache etapów (whisper/klatki/nano) — pełny re-run od zera")
+    run_cmd.add_argument("--cache-dir", type=str, default=None, help="Katalog cache etapów (default: ~/.cache/vtd lub $VIDEO_TO_MANUAL_CACHE_DIR)")
+    run_cmd.add_argument("--meeting-max-frames", type=int, default=40, help="Maksymalna liczba reprezentatywnych klatek użytych do fuzji w trybie meeting (pełne raw/unique zostają w archiwum)")
+    run_cmd.add_argument("--semantic-video-map", action="store_true", help="Opcjonalna mapa semantyczna Gemini (głównie meeting; kandydaci, nie dowody)")
+    run_cmd.add_argument("--semantic-model", default="gemini-2.5-flash", help="Model Google GenAI dla semantic video map")
 
-    studio_cmd = sub.add_parser("studio", help="Uruchom interfejs webowy Video-to-Doc Studio")
-    studio_cmd.add_argument("--host", type=str, default=None, help="Adres nasłuchiwania (domyślnie 127.0.0.1)")
-    studio_cmd.add_argument("--port", type=int, default=None, help="Port serwera (domyślnie 9870)")
-
-    rerender_cmd = sub.add_parser("rerender", help="Przeładuj i zregeneruj dokumentację z istniejącego folderu")
-    rerender_cmd.add_argument("output_dir", type=str, help="Ścieżka do folderu z wygenerowaną dokumentacją")
+    structured = sub.add_parser("meeting-structured", help="Renderuj meeting.v2 z istniejącego JSON bez uruchamiania nagrania")
+    structured.add_argument("input_json", type=str)
+    structured.add_argument("--output", "-o", type=str, required=True)
+    structured.add_argument("--title", "-t", type=str, default="Spotkanie")
 
     return p
 
@@ -108,6 +195,9 @@ def _build_metadata(
         "document_status": safe_status,
         "mode": mode,
         "output_mode": output_mode,
+        "transcription_engine": "local-whisper",
+        "transcription_model": "medium",
+        "track_requested": "auto",
         "video_file": video_path.name,
         "generated_at": datetime.now(timezone.utc).isoformat(),
         "pipeline": "Hermes Video-to-Manual — manual-first, lokalny DRAFT",
@@ -120,12 +210,17 @@ def run_pipeline(
     output_dir: Path,
     title: str,
     device: str = "auto",
-    model_size: str = "large-v3",
+    transcription_engine: str = "local-whisper",
+    model_size: str = "medium",
+    diarization: bool = False,
     scene_threshold: Optional[float] = None,
     track: str = "mic",
     mode: str = "manual",
     enrich: bool = False,
-    enrich_model: str = "erp-manual",
+    enrich_model: str = "google/gemini-3.8-flash",
+    curate: bool = False,
+    curate_model: str = "google/gemini-3.8-flash",
+    curate_scope: str = "program",
     client: Optional[str] = None,
     process: Optional[str] = None,
     module: Optional[str] = None,
@@ -141,10 +236,33 @@ def run_pipeline(
     nano_banana: bool = False,
     nano_mode: str = "located",
     nano_auto_accept: bool = False,
+    no_cache: bool = False,
+    cache_dir: Optional[str] = None,
+    meeting_max_frames: int = 40,
+    semantic_video_map: bool = False,
+    semantic_model: str = "gemini-2.5-flash",
 ):
     if not video_path.exists():
         print(f"BŁĄD: Plik wideo {video_path} nie istnieje!")
         sys.exit(1)
+
+    # Dysk cache etapów (whisper / klatki / nano) — przyspiesza iterację nad enrichmentem/renderem.
+    _cache_root: Optional[Path] = None
+    _video_fp = ""
+    if not no_cache:
+        try:
+            _cache_root = Path(cache_dir) if cache_dir else stage_cache.default_cache_dir()
+            _video_fp = stage_cache.video_fingerprint(video_path)
+            print(f"Cache etapów: WŁĄCZONY ({_cache_root})")
+        except Exception as e:
+            _cache_root = None
+            print(f"Cache etapów: wyłączony (błąd inicjalizacji: {e})")
+    else:
+        print("Cache etapów: wyłączony (--no-cache)")
+
+    if curate and not enrich:
+        print("Uwaga: --curate wymaga --enrich (kuracja działa na treści po redakcji LLM) — pomijam kurację.")
+        curate = False
 
     chosen_device, chosen_compute = resolve_device_and_compute(device)
 
@@ -155,7 +273,10 @@ def run_pipeline(
             document_title=title,
             whisper_device=chosen_device,
             whisper_compute_type=chosen_compute,
+            transcription_engine=transcription_engine,
             whisper_model=model_size,
+            track=track,
+            diarization=diarization,
             scene_threshold=scene_threshold
         )
     else:
@@ -165,10 +286,14 @@ def run_pipeline(
             document_title=title,
             whisper_device=chosen_device,
             whisper_compute_type=chosen_compute,
-            whisper_model=model_size
+            transcription_engine=transcription_engine,
+            whisper_model=model_size,
+            track=track,
+            diarization=diarization
         )
 
     output_dir.mkdir(parents=True, exist_ok=True)
+    semantic_result = None
     frames_dir = output_dir / "frames"
     wav_path = output_dir / "mic_isolated.wav"
     try:
@@ -180,7 +305,7 @@ def run_pipeline(
     auto_detection = None
     if track == "auto":
         try:
-            from vtd.core.audio_detection import detect_best_track as _detect_best_track
+            from vtd.audio_detection import detect_best_track as _detect_best_track
             auto_detection = _detect_best_track(str(config.video_path))
             # synchronizuj stream_count jeśli detekcja zwróciła inną liczbę
             if auto_detection.get("n_streams", 0) > 0:
@@ -230,12 +355,47 @@ def run_pipeline(
     print(f"Metadane: klient={client or 'DO UZUPEŁNIENIA'} | proces={process or 'DO UZUPEŁNIENIA'} | moduł={module or 'DO UZUPEŁNIENIA'} | env={environment or 'DO UZUPEŁNIENIA'} | status={document_status} | output={output_mode}")
 
     metadata = _build_metadata(title, mode, client, process, module, environment, author, document_status, output_mode, video_path)
+    if semantic_result is not None:
+        metadata["semantic_video_map"] = {"status": semantic_result.status, "candidate_count": len(semantic_result.items), "artifact": "semantic_video_map.json"}
+        (output_dir / "metadata.json").write_text(json.dumps(metadata, indent=2, ensure_ascii=False), encoding="utf-8")
 
-    transcriber = Transcriber(
-        model_size=config.whisper_model,
-        device=config.whisper_device,
-        compute_type=config.whisper_compute_type
-    )
+    _transcriber_holder: List[Optional[Transcriber]] = [None]
+
+    def _get_transcriber() -> Transcriber:
+        if _transcriber_holder[0] is None:
+            _transcriber_holder[0] = Transcriber(
+                model_size=config.whisper_model,
+                device=config.whisper_device,
+                compute_type=config.whisper_compute_type,
+                diarization=config.diarization
+            )
+        return _transcriber_holder[0]
+
+    def _transcribe_cached(wav_p: Path, label: str, track_ctx: str) -> List[SpeechSegment]:
+        """Transkrypcja z cache (fingerprint wideo + tor + model). Lazy load whisper tylko przy miss."""
+        cache_key = None
+        if _cache_root:
+            cache_key = stage_cache.stage_key(
+                "transcribe", _video_fp, track_ctx,
+                config.whisper_model, config.whisper_device,
+                config.whisper_compute_type, config.whisper_language,
+            )
+            data = stage_cache.load_json(_cache_root, "transcribe", cache_key)
+            if data is not None:
+                print(f"  [CACHE] Transkrypcja ({label}): hit — pomijam whisper ({len(data)} segmentów)")
+                return [
+                    SpeechSegment(start=float(d["start"]), end=float(d["end"]), text=d["text"])
+                    for d in data
+                ]
+        segs = _get_transcriber().transcribe(wav_p, language=config.whisper_language)
+        write_transcription_artifacts(output_dir, segs, {"transcription_model": config.whisper_model, "track_chosen": track, "track_requested": track})
+        if _cache_root and cache_key:
+            stage_cache.save_json(
+                _cache_root, "transcribe", cache_key,
+                [{"start": s.start, "end": s.end, "text": s.text} for s in segs],
+            )
+            print(f"  [CACHE] Transkrypcja ({label}): zapisano ({len(segs)} segmentów)")
+        return segs
 
     transcripts: List[SpeechSegment] = []
     pauses = []
@@ -252,17 +412,25 @@ def run_pipeline(
 
         print("Krok 3/6: Transkrypcja mowy (NVIDIA faster-whisper)...")
         print("  -> Transkrypcja wypowiedzi wdrożeniowca (Track 2)...")
-        segs_mic = transcriber.transcribe(wav_mic, language=config.whisper_language)
+        segs_mic = _transcribe_cached(wav_mic, "Track 2 / wdrożeniowiec", "meeting-track2")
         for s in segs_mic:
             s.speaker = "Wdrożeniowiec"
 
         print(f"  -> Transkrypcja Desktop/system audio — niezweryfikowany rozmówca (Track 3, {len(segs_mic)} seg wdrożeniowca)...")
-        segs_client = transcriber.transcribe(wav_client, language=config.whisper_language)
+        segs_client = _transcribe_cached(wav_client, "Track 3 / desktop", "meeting-track3")
         for s in segs_client:
             s.speaker = SYSTEM_AUDIO_LABEL
 
         transcripts = sorted(segs_mic + segs_client, key=lambda x: x.start)
         print(f"  -> Łącznie uzyskano {len(transcripts)} segmentów dialogu.")
+        # The meeting path transcribes two tracks. Write the final merged
+        # artifact only after both tracks are available; writing inside each
+        # per-track call would overwrite the first track with the second one.
+        write_transcription_artifacts(output_dir, transcripts, {
+            "transcription_model": config.whisper_model,
+            "track_chosen": "meeting (Track 2 + Track 3)",
+            "track_requested": track,
+        })
         wav_path = wav_mic
     else:
         if track == "auto":
@@ -309,18 +477,56 @@ def run_pipeline(
         print(f"  -> Wykryto {len(pauses)} istotnych pauz w wypowiedzi.")
 
         print("Krok 3/6: Transkrypcja mowy po polsku (faster-whisper)...")
-        transcripts = transcriber.transcribe(wav_path, language=config.whisper_language)
+        transcripts = _transcribe_cached(wav_path, desc, f"track-{chosen_track}")
         for s in transcripts:
             s.speaker = speaker_label
         print(f"  -> Uzyskano {len(transcripts)} segmentów wypowiedzi.")
 
-    print("Krok 4/6: Ekstrakcja klatek zmian scen (FFmpeg scene detection)...")
-    raw_frames = extract_scene_frames(config.video_path, frames_dir, threshold=config.scene_threshold)
-    print(f"  -> Wycięto {len(raw_frames)} kandydujących klatek zmian ekranu.")
+    # Gemini is strictly optional context; local Whisper remains authoritative.
+    if semantic_video_map:
+        from vtd.transcriber import format_transcript_for_prompt
+        semantic_result = SemanticVideoMapAdapter(model=semantic_model).analyze(
+            video_path, transcript_context=format_transcript_for_prompt(transcripts))
+        semantic_result.write_artifacts(output_dir)
+        print(f"Semantic video map: {semantic_result.status} ({len(semantic_result.items)} kandydatów)")
 
-    print("Krok 5/6: Deduplikacja percepcyjna klatek (pHash)...")
-    unique_frames = filter_duplicate_frames(raw_frames, hamming_threshold=config.phash_threshold)
-    print(f"  -> Pozostawiono {len(unique_frames)} unikalnych klatek do instrukcji.")
+    print("Krok 4/6: Ekstrakcja klatek zmian scen (FFmpeg scene detection)...")
+    from vtd.dedup import ExtractedFrame
+    _frames_key = None
+    _frames_from_cache = False
+    raw_frames: List[ExtractedFrame] = []
+    unique_frames: List[ExtractedFrame] = []
+    if _cache_root:
+        _frames_key = stage_cache.stage_key(
+            "frames", _video_fp, config.scene_threshold, config.phash_threshold, config.scale_width,
+        )
+        _fmeta = stage_cache.load_json(_cache_root, "frames", _frames_key)
+        if _fmeta and stage_cache.restore_dir_tar(_cache_root, "frames", _frames_key, frames_dir):
+            _expected = {n for _, n in _fmeta.get("raw", [])}
+            for _stale in frames_dir.glob("scene_*.png"):
+                if _stale.name not in _expected:
+                    _stale.unlink(missing_ok=True)
+            raw_frames = [ExtractedFrame(timestamp=float(t), path=frames_dir / n) for t, n in _fmeta["raw"]]
+            unique_frames = [ExtractedFrame(timestamp=float(t), path=frames_dir / n) for t, n in _fmeta["unique"]]
+            _frames_from_cache = True
+            print(f"  [CACHE] Klatki: hit — pomijam ekstrakcję i dedup ({len(raw_frames)} raw / {len(unique_frames)} unique)")
+    if not _frames_from_cache:
+        raw_frames = extract_scene_frames(config.video_path, frames_dir, threshold=config.scene_threshold)
+        print(f"  -> Wycięto {len(raw_frames)} kandydujących klatek zmian ekranu.")
+
+        print("Krok 5/6: Deduplikacja percepcyjna klatek (pHash)...")
+        unique_frames = filter_duplicate_frames(raw_frames, hamming_threshold=config.phash_threshold)
+        print(f"  -> Pozostawiono {len(unique_frames)} unikalnych klatek do instrukcji.")
+        if _cache_root and _frames_key:
+            try:
+                stage_cache.save_dir_tar(_cache_root, "frames", _frames_key, frames_dir, name_prefix="scene_")
+                stage_cache.save_json(_cache_root, "frames", _frames_key, {
+                    "raw": [[f.timestamp, f.path.name] for f in raw_frames],
+                    "unique": [[f.timestamp, f.path.name] for f in unique_frames],
+                })
+                print(f"  [CACHE] Klatki: zapisano ({len(raw_frames)} raw / {len(unique_frames)} unique)")
+            except Exception as e:
+                print(f"  [CACHE] Klatki: zapis nieudany ({e})")
 
     print("Krok 6/6: Fuzja sygnałów i generowanie dokumentacji...")
     # Wyznacz duration dla siatki
@@ -328,21 +534,34 @@ def run_pipeline(
         import subprocess as _sp, json as _js
         # ffprobe duration fallback
         video_duration = None
-        if transcripts:
+        # ffprobe jest źródłem nadrzędnym: transkrypcja może nie obejmować ciszy
+        # na początku/końcu nagrania, a selekcja klatek musi pokrywać całe wideo.
+        try:
+            res = _sp.run(["ffprobe", "-v", "error", "-show_entries", "format=duration", "-of", "json", str(video_path)], capture_output=True, text=True, timeout=10)
+            if res.returncode == 0:
+                d = _js.loads(res.stdout)
+                video_duration = float(d["format"]["duration"])
+        except Exception:
+            pass
+        if video_duration is None and transcripts:
             video_duration = max(t.end for t in transcripts) if transcripts else None
         if video_duration is None:
-            try:
-                res = _sp.run(["ffprobe", "-v", "error", "-show_entries", "format=duration", "-of", "json", str(video_path)], capture_output=True, text=True, timeout=10)
-                if res.returncode == 0:
-                    d = _js.loads(res.stdout)
-                    video_duration = float(d["format"]["duration"])
-            except Exception:
-                pass
+            video_duration = max((f.timestamp for f in unique_frames), default=0.0) + 5.0
     except Exception:
         video_duration = None
 
+    # Meeting: protokół potrzebuje reprezentatywnych dowodów, nie każdej zmiany okna.
+    # Zachowaj pełne raw/unique w frames/, lecz do fuzji wybierz max 40 klatek
+    # równomiernie po osi czasu, preferując najostrzejszą w każdym przedziale.
+    frames_for_fusion = unique_frames
+    meeting_max_frames = max(1, int(meeting_max_frames))
+    if mode == "meeting" and len(unique_frames) > meeting_max_frames:
+        from vtd.frame_sharpness import select_representative_frames
+        frames_for_fusion = select_representative_frames(unique_frames, video_duration, max_frames=meeting_max_frames)
+        print(f"  -> Meeting frame selection: {len(unique_frames)} unique → {len(frames_for_fusion)} reprezentatywnych klatek.")
+
     steps = fuse_signals_into_steps_v2(
-        unique_frames, pauses, transcripts,
+        frames_for_fusion, pauses, transcripts,
         video_duration=video_duration,
         max_step_seconds=max_step_seconds,
         grid_interval=grid_interval,
@@ -372,7 +591,7 @@ def run_pipeline(
     if frame_qa:
         print("Kontrola czytelności klatek (LLM) — Frame QA...")
         try:
-            from vtd.core.frame_qa import FrameReviewer, MAX_REVIEWS, improve_step_frame
+            from vtd.frame_qa import FrameReviewer, MAX_REVIEWS, improve_step_frame
             reviewer = FrameReviewer()
             # BATCH LIMIT: max 12 wywołań review na nagranie — przy większej liczbie kroków review tylko najdłuższe i te bez mowy
             MAX_R = MAX_REVIEWS
@@ -448,8 +667,8 @@ def run_pipeline(
     if annotate and mode == "manual":
         print("Generowanie adnotacji AI na zrzutach (instrukcja)...")
         try:
-            from vtd.core.element_locator import locate_words, plan_annotations
-            from vtd.core.annotator import load_frame, annotate_frame
+            from vtd.element_locator import locate_words, plan_annotations
+            from vtd.annotator import load_frame, annotate_frame
             # mapa verdict dla pomijania wrong/unclear/unknown
             qa_verdict_map = {r["step_number"]: r.get("verdict", "ok") for r in frame_qa_results} if frame_qa else {}
             # Track skipped annotations due frame_qa
@@ -570,12 +789,12 @@ def run_pipeline(
                 annotations_per_step[str(s.step_number)] = 0
 
     # ===== Etap 4: NANO BANANA (Gemini Flash Image) — enhancement/oznaczenia klatek =====
-    nano_stats = {"enabled": False, "processed": 0, "accepted": 0, "rejected": 0, "cost_usd": 0.0, "details": []}
+    nano_stats = {"enabled": False, "processed": 0, "accepted": 0, "rejected": 0, "cost_usd": 0.0, "details": [], "cache_hits": 0}
     if 'enriched_data' not in locals():
         enriched_data = None
     if nano_banana and mode == "manual":
         try:
-            from vtd.core.image_enhancer import (
+            from vtd.image_enhancer import (
                 enhance_frame_composite, enhance_frame_located, resolve_gemini_key, EnhanceError,
             )
             api_key = resolve_gemini_key()
@@ -588,6 +807,11 @@ def run_pipeline(
                 qa_map = {r["step_number"]: r.get("verdict", "ok") for r in frame_qa_results} if frame_qa else {}
                 mode_label = "LOCATED (locator+draw)" if nano_mode == "located" else "COMPOSITE (nano-banana-2)"
                 print(f"Nano Banana ({mode_label}) + weryfikator gemini-flash...")
+                try:
+                    from vtd.image_enhancer import nano_cache_signature as _nano_sig_fn
+                    _nano_sig = _nano_sig_fn()
+                except Exception:
+                    _nano_sig = ""
                 for s in steps:
                     if s.step_number in qa_map and qa_map[s.step_number] in ("wrong", "skipped"):
                         nano_stats["details"].append({"step": s.step_number, "status": "pominięty (frame_qa)"})
@@ -601,21 +825,55 @@ def run_pipeline(
                                 break
                     target_description = es_desc or (s.speech_text or "").strip()
                     step_text = s.speech_text or ""
-                    try:
-                        _enhancer = enhance_frame_located if nano_mode == "located" else enhance_frame_composite
-                        res = _enhancer(
-                            s.frame_path, api_key,
-                            target_description=target_description,
-                            step_text=step_text,
-                            output_dir=output_dir / "frames_enhanced",
-                            verify_goal=True,
-                            step_number=s.step_number,
+                    _nano_key = None
+                    if _cache_root and _nano_sig:
+                        try:
+                            _nano_key = stage_cache.stage_key(
+                                "nano", nano_mode, _nano_sig,
+                                stage_cache.file_sha256(s.frame_path),
+                                s.step_number or 0, target_description, step_text,
+                            )
+                        except Exception:
+                            _nano_key = None
+                    res = None
+                    if _nano_key:
+                        _cached_res = stage_cache.nano_lookup(
+                            _cache_root, _nano_key, output_dir / "frames_enhanced" / s.frame_path.name
                         )
-                    except EnhanceError as e:
-                        print(f"  [NANO] Krok {s.step_number}: błąd modelu: {e}")
-                        nano_stats["details"].append({"step": s.step_number, "status": "błąd modelu", "error": str(e)[:120]})
-                        continue
+                        if _cached_res is not None:
+                            res = _cached_res
+                            print(f"  [CACHE] Krok {s.step_number}: nano hit — pomijam wywołania AI")
+                    if res is None:
+                        try:
+                            if nano_mode == "located":
+                                res = enhance_frame_located(
+                                    s.frame_path, api_key,
+                                    target_description=target_description,
+                                    step_text=step_text,
+                                    output_dir=output_dir / "frames_enhanced",
+                                    verify_goal=True,
+                                    step_number=s.step_number,
+                                )
+                            else:
+                                res = enhance_frame_composite(
+                                    s.frame_path, api_key,
+                                    target_description=target_description,
+                                    step_text=step_text,
+                                    output_dir=output_dir / "frames_enhanced",
+                                    verify_goal=True,
+                                )
+                        except EnhanceError as e:
+                            print(f"  [NANO] Krok {s.step_number}: błąd modelu: {e}")
+                            nano_stats["details"].append({"step": s.step_number, "status": "błąd modelu", "error": str(e)[:120]})
+                            continue
+                        if _nano_key and isinstance(res, dict) and res.get("status") == "accepted" and res.get("path"):
+                            try:
+                                stage_cache.nano_store(_cache_root, _nano_key, res, Path(res["path"]))
+                            except Exception:
+                                pass
                     nano_stats["processed"] += 1
+                    if res.get("cached"):
+                        nano_stats["cache_hits"] += 1
                     nano_stats["cost_usd"] += res.get("cost_usd", 0.0)
                     if res["status"] != "accepted":
                         print(f"  [NANO] Krok {s.step_number}: REJECTED — {res['reason']}")
@@ -625,8 +883,11 @@ def run_pipeline(
                     if nano_auto_accept:
                         (output_dir / "frames_enhanced" / (Path(s.frame_path.name).stem + "_accepted")).write_text("auto", encoding="utf-8")
                     nano_stats["accepted"] += 1
-                    nano_stats["details"].append({"step": s.step_number, "status": "accepted", "file": s.frame_path.name, "cost_usd": res.get("cost_usd", 0.0), "target_ok": res.get("target_ok")})
-                print(f"  -> Nano Banana composite: {nano_stats['accepted']} przyjętych, {nano_stats['rejected']} odrzuconych (jednolitość+cel), koszt ~${nano_stats['cost_usd']:.3f}")
+                    nano_stats["details"].append({"step": s.step_number, "status": "accepted", "file": s.frame_path.name, "cost_usd": res.get("cost_usd", 0.0), "target_ok": res.get("target_ok"), "cached": bool(res.get("cached"))})
+                if nano_stats.get("cache_hits"):
+                    print(f"  -> Nano Banana: {nano_stats['accepted']} przyjętych, {nano_stats['rejected']} odrzuconych (jednolitość+cel), koszt ~${nano_stats['cost_usd']:.3f}, cache {nano_stats['cache_hits']} hit")
+                else:
+                    print(f"  -> Nano Banana composite: {nano_stats['accepted']} przyjętych, {nano_stats['rejected']} odrzuconych (jednolitość+cel), koszt ~${nano_stats['cost_usd']:.3f}")
         except Exception as e:
             print(f"  [NANO] Błąd globalny enhancement: {e}")
 
@@ -643,7 +904,7 @@ def run_pipeline(
         "steps_without_speech": steps_without_evidence,
         "segments_without_frame": segments_without_frame,
         "timestamp_warnings": ts_warnings,
-        "note": "Word-level timestamps nie są używane — pipeline segment-level. Dowód per krok: timestamp start/end + nazwa klatki.",
+        "note": "Lokalny Whisper jest źródłem transkrypcji; word timestamps zapisane w transcription_segments.json. Gemini to kandydaci, nie dowody.",
         "narrative_splits": narrative_splits_count,
         "grid_frames": grid_count,
         "max_step_seconds": max_step_seconds,
@@ -665,6 +926,11 @@ def run_pipeline(
             metadata["track_chosen"] = auto_detection.get("best_track_label")
         else:
             metadata["track_chosen"] = "mic"
+    metadata["transcription_engine"] = config.transcription_engine
+    metadata["transcription_model"] = config.whisper_model
+    metadata["transcription_device"] = config.whisper_device
+    metadata["track_requested"] = track
+    metadata["diarization"] = {"requested": diarization, "available": bool(getattr(_transcriber_holder[0], "diarization_available", False))}
     metadata["enrich_status"] = "not_requested" if not enrich else "pending"
     # Store QA results for enrich context
     metadata["frame_qa_results"] = frame_qa_results if frame_qa else []
@@ -684,7 +950,7 @@ def run_pipeline(
     if enrich:
         try:
             print(f"Wzbogacanie treści draftu przez model LLM ({enrich_model}) — tryb {mode}...")
-            from vtd.core.enricher import enrich_steps_with_llm
+            from vtd.enricher import enrich_steps_with_llm
             # Pass frame QA context: add reason to steps for enricher prompt
             # Enricher will read metadata frame_qa_results if available — we inject via steps extra attr
             # Simplest: temporarily append reason to speech_text for enricher
@@ -696,19 +962,20 @@ def run_pipeline(
                         # append one line context for LLM redaction
                         s.speech_text = (s.speech_text + f" [Frame QA: {r['verdict']} — {r['reason']}]").strip()
             enriched_data = enrich_steps_with_llm(
-                title=title, steps=steps, model=enrich_model, timeout=180,
+                title=title, steps=steps, model=enrich_model, timeout=420,
                 client=client, process=process, module=module, environment=environment,
                 author=author, document_status=document_status, mode=mode,
             )
             if enriched_data:
                 print("  -> Pomyślnie zredagowano draft przez LLM (status DRAFT / DO WERYFIKACJI).")
                 print("Bramka QA: Ograniczona kontrola spójności DRAFT (bez połączenia z bazą ERP)...")
-                from vtd.core.qa_verifier import audit_and_fix_manual
-                enriched_data, qa_issues = audit_and_fix_manual(
+                from vtd.qa_verifier import audit_and_fix_manual
+                enriched_data, qa_issues, qa_audit = audit_and_fix_manual(
                     enriched_data=enriched_data,
                     steps=steps,
                     title=title,
-                    model="antigravity/gemini-3.8-flash-tiered"
+                    model=enrich_model,
+                    timeout=420,
                 )
                 if qa_issues:
                     print("  [QA AUDYT — DRAFT / DO WERYFIKACJI] Uwagi do ręcznej weryfikacji:")
@@ -718,16 +985,24 @@ def run_pipeline(
                     print("  [QA AUDYT] DRAFT / DO WERYFIKACJI — brak automatycznych uwag, wymagana ręczna weryfikacja.")
 
                 qa_report_path = output_dir / "QA_AUDIT.md"
+                _qa_mode_txt = ("audyt LLM w chunkach" if qa_audit.get("mode") == "llm-chunked"
+                                else "reguły regex — audyt LLM niedostępny")
                 qa_md = [
                     f"# Raport Kontroli Spójności DRAFT: {title}",
                     "",
                     f"**Status dokumentu:** DRAFT / DO WERYFIKACJI — wymaga ręcznej weryfikacji przez wdrożeniowca. Nie jest to weryfikacja merytoryczna z bazą ERP.",
-                    f"**Model audytujący (ograniczony zakres):** {enrich_model}",
+                    f"**Model audytujący (ograniczony zakres):** {qa_audit.get('model', '?')} (fallback: {qa_audit.get('fallback_model', '?')}) — tryb: {_qa_mode_txt}",
                     f"**Data:** {datetime.now(timezone.utc).isoformat()}",
                     "",
                     "## Uwagi do weryfikacji (nie są to potwierdzenia z bazy ERP):",
                     ""
                 ]
+                if qa_audit.get("mode") == "llm-chunked":
+                    qa_md.append(f"Audyt wykonany w {qa_audit.get('chunks_ok')}/{qa_audit.get('chunks_total')} chunkach kroków; automatyczne poprawki: {qa_audit.get('steps_corrected')}.")
+                    qa_md.append("")
+                elif qa_audit.get("reason"):
+                    qa_md.append(f"Powód trybu awaryjnego: {qa_audit.get('reason')}")
+                    qa_md.append("")
                 if qa_issues:
                     for iss in qa_issues:
                         qa_md.append(f"- {iss}")
@@ -736,8 +1011,39 @@ def run_pipeline(
                 qa_md.append("")
                 qa_md.append("> **Uwaga:** Ten raport to jedynie lokalna kontrola spójności draftu. Nie wykonano połączenia z bazą ERP. Status zawsze DRAFT / DO WERYFIKACJI.")
                 qa_report_path.write_text("\n".join(qa_md), encoding="utf-8")
-                metadata["enrich_status"] = "success"
+                metadata["enrich_status"] = enriched_data.get("enricher_status", "success")
+                if metadata["enrich_status"] == "PARTIAL":
+                    warning = enriched_data.get("enricher_warning") or {}
+                    metadata["qa_issues"] = list(metadata.get("qa_issues", [])) + [
+                        "ENRICHER_WARNING: część chunków nie została wzbogacona; wymagają ręcznej weryfikacji."
+                    ]
+                    (output_dir / "ENRICHER_WARNING.md").write_text(
+                        f"# Ostrzeżenie Enricher: {title}\n\n**Status:** PARTIAL / DO WERYFIKACJI\n\n"
+                        f"Nie wzbogacono chunków: {warning.get('failed_chunks', [])}. Dokument wymaga ręcznej weryfikacji.\n",
+                        encoding="utf-8"
+                    )
+                metadata["qa_audit"] = qa_audit
                 metadata["qa_issues"] = qa_issues
+                if metadata["enrich_status"] == "PARTIAL":
+                    metadata["qa_issues"].append(
+                        "ENRICHER_WARNING: część chunków nie została wzbogacona; wymagają ręcznej weryfikacji."
+                    )
+
+                if curate:
+                    print("Kuracja treści — wybór kroków-operacji do instrukcji (agent)...")
+                    from vtd.curator import curate_steps, render_curation_report
+                    enriched_data, steps, curation_info = curate_steps(
+                        enriched_data=enriched_data,
+                        steps=steps,
+                        title=title,
+                        model=curate_model,
+                        timeout=420,
+                        scope=curate_scope,
+                    )
+                    (output_dir / "CURATION_REPORT.md").write_text(
+                        render_curation_report(title, curation_info), encoding="utf-8"
+                    )
+                    metadata["curation"] = curation_info
             else:
                 print("  -> Ostrzeżenie: wzbogacanie LLM zwróciło None — draft bez enrich, status DRAFT / DO WERYFIKACJI.")
                 metadata["enrich_status"] = "failed"
@@ -992,7 +1298,39 @@ def run_pipeline(
             else:
                 enriched_data["steps"].append({"step_number": sn, "annotations": anns, "annotation_legend": legend})
 
-    doc = render_markdown_manual(title=title, steps=steps, base_dir=output_dir, enriched_data=enriched_data, metadata=metadata, mode=mode)
+    # MANUAL v2 is the canonical professional manual path; meeting remains legacy/v2.
+    manual_v2_doc = None
+    if mode == "manual":
+        # Qualify enriched title/description, not only raw speech_text.  Keep the
+        # fusion timing/frame chain as explicit provenance; evidence selection stays
+        # fail-closed and is intentionally absent in this adapter path.
+        manual_candidates, evidence_by_candidate = _build_manual_v2_inputs(steps, enriched_data)
+        manual_v2_doc = build_manual_v2(
+            title,
+            manual_candidates,
+            evidence_by_candidate=evidence_by_candidate,
+        )
+        # Keep metadata truthful to the canonical MANUAL v2 document, not only
+        # to the upstream fusion count.  This also exposes PARTIAL/REJECTED in
+        # machine-readable output when fusion produced non-action material.
+        metadata["manual_v2"] = {
+            "steps": len(manual_v2_doc.steps),
+            "status": manual_v2_doc.status,
+            "completeness": manual_v2_doc.completeness,
+            "partial_steps": sum(1 for s in manual_v2_doc.steps if s.status == "PARTIAL"),
+            "rejected_steps": sum(1 for s in manual_v2_doc.steps if s.status == "REJECTED"),
+            "accounting": manual_v2_doc.accounting(),
+        }
+        metadata["stats"]["manual_v2_steps"] = len(manual_v2_doc.steps)
+        metadata["stats"]["manual_v2_completeness"] = manual_v2_doc.completeness
+        metadata_path.write_text(json.dumps(metadata, indent=2, ensure_ascii=False), encoding="utf-8")
+        doc = render_manual_v2_markdown(
+            manual_v2_doc,
+            metadata=metadata,
+            reference_frames=[f"frames/{frame.path.name}" for frame in unique_frames if getattr(frame, "path", None)],
+        )
+    else:
+        doc = render_markdown_manual(title=title, steps=steps, base_dir=output_dir, enriched_data=enriched_data, metadata=metadata, mode=mode)
     doc_path = output_dir / "INSTRUKCJA.md"
     doc_path.write_text(doc, encoding="utf-8")
 
@@ -1003,12 +1341,25 @@ def run_pipeline(
 
     # 3. DOCX
     docx_path = output_dir / "INSTRUKCJA.docx"
-    render_docx_manual(title=title, steps=steps, output_docx=docx_path, enriched_data=enriched_data, metadata=metadata, mode=mode)
+    if mode == "manual":
+        render_manual_v2_docx(manual_v2_doc, docx_path)
+    else:
+        render_docx_manual(title=title, steps=steps, output_docx=docx_path, enriched_data=enriched_data, metadata=metadata, mode=mode)
 
     # 4. HTML
     html_path = output_dir / "INSTRUKCJA.html"
-    from vtd.builders.html_builder import render_html_manual
-    render_html_manual(title=title, steps=steps, output_html=html_path, enriched_data=enriched_data, metadata=metadata, mode=mode)
+    if mode == "manual":
+        html_path.write_text(render_manual_v2_html(manual_v2_doc), encoding="utf-8")  # type: ignore[arg-type]
+    else:
+        from vtd.html_builder import render_html_manual
+        render_html_manual(title=title, steps=steps, output_html=html_path, enriched_data=enriched_data, metadata=metadata, mode=mode)
+
+    # Meeting v2 replaces legacy meeting rendering with its independent contract.
+    if mode == "meeting":
+        meeting_data = _build_meeting_v2_input(enriched_data or {})
+        doc_path.write_text(render_meeting_markdown_v2(title, meeting_data, output_dir), encoding="utf-8")
+        render_meeting_html_v2(title, meeting_data, html_path, output_dir)
+        (output_dir / "meeting_v2.json").write_text(json.dumps(meeting_data, ensure_ascii=False, indent=2), encoding="utf-8")
 
     # 5. Prompt dla agenta
     prompt_text = build_llm_prompt(steps, module_title=title, mode=mode, metadata=metadata)
@@ -1066,6 +1417,10 @@ def run_pipeline(
                 pass
     # Dodaj frames do client-ready (dowody) — obie wersje gdy adnotacje
     manifest["artifacts"]["frames/"] = "client-ready"
+    if semantic_result is not None:
+        manifest["semantic_video_map"] = {"status": semantic_result.status, "artifact": "semantic_video_map.json", "candidate_count": len(semantic_result.items)}
+        (output_dir / "semantic_video_map.json").write_text(json.dumps(semantic_result.to_dict(), ensure_ascii=False, indent=2), encoding="utf-8")
+        manifest["artifacts"]["semantic_video_map.json"] = "internal"
     if frames_dir.exists():
         dest_frames = client_ready_dir / "frames"
         if not dest_frames.exists():
@@ -1154,51 +1509,8 @@ def run_pipeline(
     return steps
 
 
-def main(argv=None):
-    parser = build_parser()
-    args = parser.parse_args(argv)
-    if args.command == "run":
-        run_pipeline(
-            video_path=Path(args.video_path),
-            output_dir=Path(args.output),
-            title=args.title,
-            device=args.device,
-            model_size=args.model,
-            scene_threshold=args.scene_threshold,
-            track=args.track,
-            mode=args.mode,
-            enrich=args.enrich,
-            enrich_model=args.enrich_model,
-            client=getattr(args, "client", None),
-            process=getattr(args, "process", None),
-            module=getattr(args, "module", None),
-            environment=getattr(args, "environment", None),
-            author=getattr(args, "author", None),
-            document_status=getattr(args, "document_status", "DRAFT"),
-            output_mode=getattr(args, "output_mode", "both"),
-            max_step_seconds=getattr(args, "max_step_seconds", 45.0),
-            grid_interval=getattr(args, "grid_interval", 30.0),
-            frame_qa=getattr(args, "frame_qa", False),
-            annotate=getattr(args, "annotate", False),
-            nano_mode=getattr(args, "nano_mode", "located"),
-            nano_banana=getattr(args, "nano_banana", False),
-            nano_auto_accept=getattr(args, "nano_auto_accept", False),
-            min_step_seconds=getattr(args, "min_step_seconds", 6.0),
-        )
-    elif args.command == "studio":
-        import uvicorn
-        from vtd.config import load_config
-        cfg = load_config()
-        host = args.host or cfg.server.host
-        port = args.port or cfg.server.port
-        uvicorn.run("vtd.studio.app:app", host=host, port=port, reload=False)
-    elif args.command == "rerender":
-        from vtd.core.rerender_docs import rerender_output_dir
-        rerender_output_dir(Path(args.output_dir))
-    else:
-        parser.print_help()
-
-
 if __name__ == "__main__":
-    main()
+    # Keep the direct module entrypoint identical to ``python -m vtd``.
+    from vtd.__main__ import main
 
+    main()

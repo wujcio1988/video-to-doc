@@ -1,8 +1,5 @@
 """
-Video-to-Doc (VTD) — Profesjonalny generator dokumentacji technicznej i instrukcji z nagrań wideo.
+vtd - Zautomatyzowany potok tworzenia instrukcji krok po kroku z nagrań wideo OBS.
 """
-__version__ = "0.1.0"
 
-from vtd.config import AppConfig, load_config
-
-__all__ = ["__version__", "AppConfig", "load_config"]
+__version__ = "1.0.0"

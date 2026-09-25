@@ -77,7 +77,8 @@ git clone https://github.com/wujcio1988/video-to-doc.git
 cd video-to-doc
 
 # Set your API key in .env or config.yaml
-echo "OPENAI_API_KEY=your_key_here" > .env
+cp .env.example .env
+# Fill secrets locally only; never commit .env
 
 # Start the Studio in the background
 docker compose up -d
@@ -94,7 +95,7 @@ docker run -d \
   -v $(pwd)/recordings:/app/recordings \
   -v $(pwd)/output:/app/output \
   -v $(pwd)/data:/app/data \
-  -e OPENAI_API_KEY=your_key_here \
+  --env-file .env \
   ghcr.io/wujcio1988/video-to-doc:latest
 ```
 
@@ -236,6 +237,12 @@ Open your browser at `http://127.0.0.1:9870/` to access:
 - **Non-Destructive**: Original video keyframes are preserved in `frames/` unmodified; visual annotations are saved in separate subdirectories.
 
 ---
+
+## Standalone status and limitations
+
+The standalone tree contains the migrated local Whisper, model/device/track controls, provenance artifacts, manual/meeting rendering, and fail-closed optional Gemini semantic mapping. Hermes, ERP, customer directories, recordings, caches, and unattended delivery integrations are intentionally excluded. Gemini candidates remain unverified and require manual review; a missing API key never changes the transcription source.
+
+Run `python3 -m py_compile $(find vtd -name '*.py')` and `pytest -q` before release. See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md), [docs/OPERATIONS.md](docs/OPERATIONS.md), and [CHANGELOG.md](CHANGELOG.md).
 
 ## 📄 License
 
