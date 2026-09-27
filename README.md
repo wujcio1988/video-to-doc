@@ -3,6 +3,7 @@
 **Video-to-Doc (VTD)** is an autonomous, local-first engine and Web Studio that converts screen recordings, application walkthroughs, and meeting captures into structured, step-by-step technical documentation, operational manuals, and verified meeting minutes.
 
 [![Python](https://img.shields.io/badge/Python-3.10%2B-blue.svg)](https://python.org)
+[![Docker](https://img.shields.io/badge/Docker-python%3A3.11--slim-2496ED.svg)](Dockerfile)
 [![FastAPI](https://img.shields.io/badge/FastAPI-0.100%2B-009688.svg)](https://fastapi.tiangolo.com)
 [![Whisper](https://img.shields.io/badge/ASR-faster--whisper-orange.svg)](https://github.com/SYSTRAN/faster-whisper)
 [![License: MIT](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
@@ -11,14 +12,14 @@
 
 ## 🌟 Key Features
 
-- **Multi-Signal Fusion**: Synchronizes audio narration, speech pauses, screen scene changes, and on-screen text (OCR) into coherent procedural steps.
+- **Multi-Signal Fusion**: Synchronizes three signals — speech segments (faster-whisper), detected speech pauses, and visual scene changes (pHash-deduplicated keyframes) — into coherent procedural steps; on-screen OCR text is used afterwards to locate UI elements for annotations.
 - **Visual UI Annotations**: Automatically locates key UI elements using OCR TSV coordinates and draws non-destructive visual guides (focus arrows, bounding boxes, numbered sequence badges, background dimming).
 - **Frame Quality Assurance**: Automatically evaluates screenshot readability, rankings frames by Laplacian sharpness variance to select the crispest frame for every step.
-- **Universal LLM & Vision Support**: Fully compatible with any OpenAI-compatible API (OpenAI GPT-4o/4o-mini, OpenRouter, local Ollama, LM Studio, Groq, vLLM, or self-hosted gateways).
+- **Universal LLM Support**: Fully compatible with any OpenAI-compatible chat API (OpenAI GPT-4o-mini, OpenRouter, local Ollama, LM Studio, Groq, vLLM, or self-hosted gateways). Optional LLM features (step enrichment, frame QA review, AI annotations) send text/frame data to your configured provider.
 - **Multi-Format Export**: Generates clean Markdown (`INSTRUKCJA.md`), standalone responsive HTML with embedded CSS (`INSTRUKCJA.html`), and formatted Microsoft Word documents (`INSTRUKCJA.docx`).
 - **Two Operation Modes**:
   - `manual`: Step-by-step procedural manual with action steps, tips, and warnings.
-  - `meeting`: Structured protocol with decisions, participants, action items, deadlines, and open questions.
+  - `meeting`: Structured protocol with decisions, participants, action items, deadlines, and open questions. Fields that cannot be extracted from the recording are marked **`DO POTWIERDZENIA`** (to confirm), never invented.
 - **Dual Interface**:
   - **CLI**: Fast, scriptable, batch-friendly headless execution.
   - **Web Studio**: Modern, lightweight FastAPI dashboard with a persistent task queue, live progress polling, and instant document previews.
@@ -225,13 +226,26 @@ Open your browser at `http://127.0.0.1:9870/` to access:
 - **Dashboard**: Overview of discovered recordings and task queue.
 - **New Task**: Interactive form with automatic audio track probe and mode selection.
 - **Task Monitor**: Real-time progress polling, stage updates, and live execution logs.
-- **Results Viewer**: Instant side-by-side preview of generated Markdown, HTML, and Word outputs.
+- **Results Viewer**: Instant preview of the generated Markdown report (`INSTRUKCJA.md` / `TRANSKRYPCJA.md`). HTML/DOCX files are written next to it — download them from the output folder.
+
+Studio security: if `VTD_AUTH_TOKEN` is set (required in Docker), all endpoints except `/health` require the `X-VTD-Token` header or the `vtd_token` cookie obtained at `/login` — the `?token=` query parameter is deliberately not accepted to avoid leaking the token into logs. Without a token, Studio binds to `127.0.0.1` only.
+
+### 3. Additional CLI Capabilities
+
+- **Frame QA** (`--frame-qa`): LLM-based review of frame readability with a hard per-run review budget; unclear/wrong frames trigger a single assisted re-crop.
+- **AI annotations** (`--annotate`): OCR TSV locating of key UI elements, drawing focus arrows, boxes and numbered badges into a separate non-destructive directory.
+- **Image enhancement** (`--nano-banana`, experimental): Gemini/OmniRoute-based frame upscaling of selected frames, with `--nano-auto-accept` to auto-accept.
+- **Output mode** (`--output-mode`): `both` (default) copies documents/frames to internal and client-ready locations; `internal` / `client-ready` restrict the manifest accordingly.
+- **Rerender** (`vtd rerender`): Regenerate MD/HTML/DOCX documents from an existing `metadata.json` without re-running the whole pipeline.
+- **Watchdog**: Optional crash-recovery watchdog for long runs (see `AUDYT_KODU.md` for known limitations).
+- **QA verifier**: Manifest-based post-run consistency checks documented in `COMPLETENESS_REPORT.md`.
+- **Studio settings page**: Editable pipeline defaults persisted in the local settings store.
 
 ---
 
 ## 🔒 Security & Privacy
 
-- **Local First**: All video processing, audio extraction, transcription, and frame extraction occur entirely on your local machine.
+- **Local First (with clear boundaries)**: Video processing, audio extraction, transcription, scene detection and frame extraction run entirely on your local machine. When enabled, optional LLM features (enrichment, frame QA, AI annotations, image enhancement) send extracted text and frames to your configured API provider — nothing is ever sent anywhere else.
 - **Manual-First Contract**: All generated documents are stamped as **`DRAFT / FOR VERIFICATION`**. The tool never automatically disseminates or publishes documentation without human sign-off.
 - **Non-Destructive**: Original video keyframes are preserved in `frames/` unmodified; visual annotations are saved in separate subdirectories.
 
