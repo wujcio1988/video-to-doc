@@ -1,0 +1,25 @@
+<!DOCTYPE html>
+<html lang="pl">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Logowanie — Video-to-Doc Studio</title>
+  <link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+<div class="container" style="max-width:380px; margin-top:10vh;">
+  <h1>Video-to-Doc Studio</h1>
+  {% if error %}<p style="color:#b71c1c;"><strong>Nieprawidłowy token.</strong></p>{% endif %}
+  <form method="post" action="/login" class="form">
+    <label>Token (VTD_AUTH_TOKEN):<br>
+      <input type="password" name="token" autofocus required style="width:100%">
+    </label>
+    <div style="margin-top:1em">
+      <button type="submit" class="btn btn-primary">Wejdź</button>
+    </div>
+  </form>
+  <p><small>Dostęp po tokenie z .env (VTD_AUTH_TOKEN). Token trafia do treści POST,
+  nie do URL — nie staje się częścią historii przeglądarki ani logów serwera.</small></p>
+</div>
+</body>
+</html>

@@ -16,10 +16,21 @@ from vtd.core.fusion import ManualStep
 from vtd.providers import get_llm_provider, robust_json_decode
 
 
+# GF-021: cache OCR per (ścieżka, mtime) — ta sama klatka bywała OCR-owana 3×
+# w jednym przebiegu (enricher, locator, QA); cache eliminuje powtórzenia.
+_ocr_cache: Dict[str, str] = {}
+
+
 def extract_frame_ocr(frame_path: Path) -> str:
-    """Wyciąga tekst z klatki za pomocą Tesseract OCR."""
+    """Wyciąga tekst z klatki za pomocą Tesseract OCR (z cache per plik+mtime)."""
     if not frame_path.exists():
         return ""
+    try:
+        cache_key = f"{frame_path}:{int(frame_path.stat().st_mtime)}"
+    except OSError:
+        cache_key = str(frame_path)
+    if cache_key in _ocr_cache:
+        return _ocr_cache[cache_key]
     try:
         res = subprocess.run(
             ["tesseract", str(frame_path), "stdout", "-l", "pol+eng", "--psm", "6"],
@@ -28,7 +39,9 @@ def extract_frame_ocr(frame_path: Path) -> str:
             timeout=5,
         )
         lines = [line.strip() for line in res.stdout.splitlines() if len(line.strip()) > 2]
-        return "\n".join(lines[:20])
+        text = "\n".join(lines[:20])
+        _ocr_cache[cache_key] = text
+        return text
     except Exception:
         return ""
 
@@ -71,7 +84,6 @@ def enrich_steps_with_llm(
     title: str,
     steps: List[ManualStep],
     model: Optional[str] = None,
-    timeout: int = 180,
     client: Optional[str] = None,
     process: Optional[str] = None,
     module: Optional[str] = None,
@@ -80,10 +92,16 @@ def enrich_steps_with_llm(
     document_status: str = "DRAFT",
     mode: str = "manual",
     reference_dir: Optional[Path] = None,
+    frame_qa_results: Optional[List[Dict[str, Any]]] = None,
 ) -> Optional[Dict[str, Any]]:
     """
     Redaguje zwięzłą instrukcję (manual) lub protokół (meeting) — manual-first, bez halucynacji.
     Jeśli metadana nie jest podana, używa 'DO UZUPEŁNIENIA'. Każdy brak faktu -> 'DO POTWIERDZENIA'.
+
+    GF-020: usunięto martwy parametr `timeout` (provider stosuje timeout z config —
+    parametr nigdy nie był używany, mylił callerów).
+    GF-007: wyniki Frame QA przyjmowane jako osobny parametr (frame_qa_results) i
+    trafiają do promptu jako osobny wiersz — NIE mutujemy już step.speech_text.
     """
     app_cfg = load_config()
     chosen_model = model or app_cfg.llm.enricher_model
@@ -145,10 +163,20 @@ def enrich_steps_with_llm(
         prompt_lines.append(f"\nKONTEKST DOKUMENTACJI REFERENCYJNEJ:\n{reference_context}\n")
 
     prompt_lines.append("\nKROKI WYKRYTE Z POTOKU (TIMESTAMPY, TRANSKRYPCJA, OCR):")
+    qa_map = {}
+    if frame_qa_results:
+        for r in frame_qa_results:
+            sn = r.get("step_number")
+            if sn and r.get("verdict") not in ("ok", "skipped", None):
+                qa_map[sn] = r
     for s in steps:
         ocr_text = extract_frame_ocr(s.frame_path)
         prompt_lines.append(f"\n--- KROK {s.step_number} (czas: {s.start_time:.1f}s - {s.end_time:.1f}s) ---")
         prompt_lines.append(f"Mowa/Lektor: {s.speech_text}")
+        # GF-007: QA jako osobny wiersz diagnostyczny, bez dopisywania do speech_text
+        r = qa_map.get(s.step_number)
+        if r:
+            prompt_lines.append(f"UWAGA QA KLATKI (do rozważenia przy redakcji): {r.get('verdict')} — {r.get('reason', '')}")
         if ocr_text:
             prompt_lines.append(f"Tekst z ekranu (OCR):\n{ocr_text[:300]}")
 

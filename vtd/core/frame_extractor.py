@@ -3,7 +3,12 @@ import subprocess
 import shutil
 from pathlib import Path
 from typing import List, Optional
+from vtd.core.audio_extractor import media_timeout
 from vtd.core.dedup import ExtractedFrame
+
+# VTD-011: limity czasu dla ffmpeg (ffprobe krótkie; operacje na całym nośniku —
+# skalowane z długością materiału, min. 120 s, max. 2 h)
+FFMPEG_FRAME_TIMEOUT = 60.0
 
 def check_ffmpeg_available():
     if not shutil.which("ffmpeg"):
@@ -22,6 +27,13 @@ def extract_scene_frames(
     """
     check_ffmpeg_available()
     output_dir.mkdir(parents=True, exist_ok=True)
+    # GF-012/GF-028: sprzątanie starych scene_*.png przed ekstrakcją — rerun na tym
+    # samym katalogu nie może zanieczyszczać wyników plikami z poprzedniego uruchomienia.
+    for old in output_dir.glob("scene_*.png"):
+        try:
+            old.unlink()
+        except OSError:
+            pass
     out_pattern = str(output_dir / "scene_%04d.png")
     
     cmd = [
@@ -31,7 +43,10 @@ def extract_scene_frames(
         "-fps_mode", "vfr",
         out_pattern
     ]
-    res = subprocess.run(cmd, capture_output=True, text=True)
+    try:
+        res = subprocess.run(cmd, capture_output=True, text=True, timeout=media_timeout(video_path, speed_factor=3.0))
+    except subprocess.TimeoutExpired as e:
+        raise RuntimeError(f"Ekstrakcja klatek przekroczyła limit czasu dla: {video_path}") from e
     
     pts_times = []
     pts_pattern = re.compile(r"pts_time:\s*([\d\.]+)")
@@ -42,9 +57,17 @@ def extract_scene_frames(
                 pts_times.append(float(m.group(1)))
                 
     files = sorted(list(output_dir.glob("scene_*.png")))
+    if len(pts_times) < len(files):
+        # GF-012: wcześniej timestamp = indeks klatki (fabrykowane czasy trafiały
+        # do dokumentu jako "dowody czasowe"). Twardy błąd — dane byłyby jawnie błędne.
+        raise RuntimeError(
+            f"Niepełne parsowanie timestampów: wycięto {len(files)} klatek, "
+            f"ale showinfo zwrócił tylko {len(pts_times)} wpisów pts_time — "
+            f"odmawiam fabrykowania timestampów."
+        )
     frames = []
     for i, file_path in enumerate(files):
-        t = pts_times[i] if i < len(pts_times) else float(i)
+        t = pts_times[i]
         frames.append(ExtractedFrame(timestamp=t, path=file_path))
     return frames
 
@@ -69,7 +92,7 @@ def extract_frame_at(
             "-vf", f"scale={scale_width}:-1",
             str(out_path),
         ]
-        res = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+        res = subprocess.run(cmd, capture_output=True, text=True, timeout=FFMPEG_FRAME_TIMEOUT)
         if res.returncode != 0 or not out_path.exists() or out_path.stat().st_size == 0:
             if out_path.exists():
                 try:

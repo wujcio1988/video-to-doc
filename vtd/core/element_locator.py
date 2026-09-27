@@ -94,7 +94,16 @@ def locate_words(frame_path: Path, words: List[str]) -> Dict[str, List[int]]:
         for k, v in best_map.items():
             result[k] = v["box"]
         return result
-    except (subprocess.TimeoutExpired, FileNotFoundError, Exception):
+    except subprocess.TimeoutExpired as e:
+        # GF-010: zawężony except — poprzednio `except (..., Exception)` połykał
+        # wszystko (w tym błędy programistyczne), maskując realne błędy.
+        print(f"[ELEMENT_LOCATOR] Ostrzeżenie: OCR przekroczył limit czasu dla {p.name}: {e}")
+        return {}
+    except FileNotFoundError:
+        print("[ELEMENT_LOCATOR] Ostrzeżenie: brak programu 'tesseract' — lokalizacja elementów niedostępna.")
+        return {}
+    except (OSError, ValueError) as e:
+        print(f"[ELEMENT_LOCATOR] Ostrzeżenie: błąd OCR dla {p.name}: {e}")
         return {}
 
 

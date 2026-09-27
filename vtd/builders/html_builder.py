@@ -1,7 +1,17 @@
 import base64
+import html as _html
 from pathlib import Path
 from typing import List, Optional, Dict, Any
 from vtd.core.fusion import ManualStep
+
+
+def esc(value: Any) -> str:
+    """GF-001: obowiązkowe escapowanie HTML dla wszystkich interpolacji tekstowych.
+
+    Treści kroku/tytuły/metadane pochodzą od użytkownika (formularz Studio, ASR) —
+    bez escapowania trafiałyby do INSTRUKCJA.html raw (XSS / wstrzyknięcie HTML).
+    """
+    return _html.escape(str(value), quote=True)
 
 def render_html_manual(
     title: str,
@@ -42,7 +52,7 @@ def render_html_manual(
                 # skip empty
                 if str(v).strip() == "":
                     continue
-                meta_items.append(f"<div><strong>{k}:</strong> {v}</div>")
+                meta_items.append(f"<div><strong>{esc(k)}:</strong> {esc(v)}</div>")
         # stats -> krótki wiersz
         stats = safe_metadata.get("stats")
         if isinstance(stats, dict):
@@ -58,13 +68,13 @@ def render_html_manual(
             idx = tad.get("best_track_index")
             label = tad.get("best_track_label", "")
             if has_speech and idx is not None:
-                meta_items.append(f"<div>Narracja: Track {idx+1} ({label}) &mdash; mowa wykryta.</div>")
+                meta_items.append(f"<div>Narracja: Track {esc(idx+1)} ({esc(label)}) &mdash; mowa wykryta.</div>")
             elif has_speech is False or idx is None:
                 meta_items.append(f"<div>Narracja: nie wykryta &mdash; dokument z klatek (OCR).</div>")
             else:
                 # fallback: if has_speech truthy but no index
                 if has_speech:
-                    meta_items.append(f"<div>Narracja: Track {label} &mdash; mowa wykryta.</div>")
+                    meta_items.append(f"<div>Narracja: Track {esc(label)} &mdash; mowa wykryta.</div>")
                 else:
                     meta_items.append(f"<div>Narracja: nie wykryta &mdash; dokument z klatek (OCR).</div>")
         # Zawsze pokaż źródła
@@ -85,17 +95,18 @@ def render_html_manual(
         raw_title = es_info.get("title")
         if mode == "meeting":
             if raw_title:
-                step_title = raw_title
+                step_title = esc(raw_title)
             else:
                 step_title = f"Temat {s.step_number}"
-            caption_text = f"Rys. {s.step_number}. {raw_title}" if raw_title else f"Rys. {s.step_number}."
+            caption_text = f"Rys. {s.step_number}. {esc(raw_title)}" if raw_title else f"Rys. {s.step_number}."
         else:
             if raw_title:
-                step_title = raw_title
+                step_title = esc(raw_title)
             else:
                 step_title = f"Krok {s.step_number}"
-            caption_text = f"Rys. {s.step_number}. {raw_title}" if raw_title else f"Rys. {s.step_number}."
+            caption_text = f"Rys. {s.step_number}. {esc(raw_title)}" if raw_title else f"Rys. {s.step_number}."
         speech_desc = es_info.get("description") or s.speech_text or "Zmiana stanu ekranu zarejestrowana na nagraniu wideo. DO POTWIERDZENIA."
+        speech_desc = esc(speech_desc)
 
         img_tag = ""
         # Prefer frames_enhanced (zaakceptowane AI) -> frames_annotated -> frames (hierarchia frame_sources)
@@ -113,18 +124,18 @@ def render_html_manual(
                 label = "Temat" if mode == "meeting" else "Krok"
                 legend_html = ""
                 if es_info.get("annotation_legend"):
-                    legend_html = f"<div style='font-size:12px; color:#64748b; margin-top:4px; font-style:italic;'>{es_info.get('annotation_legend')}</div>"
+                    legend_html = f"<div style='font-size:12px; color:#64748b; margin-top:4px; font-style:italic;'>{esc(es_info.get('annotation_legend'))}</div>"
                 elif es_info.get("annotations"):
                     parts = []
                     for a in es_info.get("annotations", []):
                         if a.get("type") == "badge" and "number" in a:
-                            parts.append(f"{a['number']} — {a.get('label', a.get('element',''))}")
+                            parts.append(f"{a['number']} — {esc(a.get('label', a.get('element','')))}")
                     if parts:
                         legend_html = f"<div style='font-size:12px; color:#64748b; margin-top:4px; font-style:italic;'>{' • '.join(parts)}</div>"
                 img_tag = f"""
                 <div class="step-image-container">
                     <img src="data:image/png;base64,{b64_data}" alt="{label} {s.step_number}">
-                    <div class="caption">{caption_text}</div>
+                    <div class="caption">{esc(caption_text)}</div>
                     {legend_html}
                 </div>
                 """
@@ -160,7 +171,7 @@ def render_html_manual(
         if es_info.get("qa_preview"):
             qa_html = f"""
             <div style="background:#fef2f2; border-left:4px solid #ef4444; padding:12px; margin-top:12px; border-radius:4px; font-size:13.5px;">
-                <strong>WYMAGA PODGLĄDU RĘCZNEGO:</strong> zrzut może nie pokazywać opisanego elementu ({es_info.get('qa_preview')})
+                <strong>WYMAGA PODGLĄDU RĘCZNEGO:</strong> zrzut może nie pokazywać opisanego elementu ({esc(es_info.get('qa_preview'))})
             </div>
             """
 
@@ -174,7 +185,7 @@ def render_html_manual(
             c_title = es_info.get("callout_title") or ("Uwaga" if c_type == "warning" else "Wskazówka")
             callout_html = f"""
             <div style="background:{c_bg}; border-left: 4px solid {c_border}; padding: 12px; margin-top: 12px; border-radius: 4px; font-size: 13.5px;">
-                <strong>{c_icon} {c_title}:</strong> {c_text}
+                <strong>{c_icon} {esc(c_title)}:</strong> {esc(c_text)}
             </div>
             """
 
@@ -203,7 +214,7 @@ def render_html_manual(
     if final_intro:
         intro_box = f"""
         <div class="intro-box">
-            <strong>{intro_label}:</strong> {final_intro}
+            <strong>{intro_label}:</strong> {esc(final_intro)}
         </div>
         """
     elif mode == "manual":
@@ -217,7 +228,7 @@ def render_html_manual(
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>{title} — DRAFT</title>
+    <title>{esc(title)} — DRAFT</title>
     <style>
         :root {{
             --primary: #0284c7;
@@ -335,7 +346,7 @@ def render_html_manual(
 <div class="container">
     <header>
         <div class="badge">{badge_text}</div>
-        <h1>{title}</h1>
+        <h1>{esc(title)}</h1>
         {meta_html}
         <div style="margin-top:12px; font-size:12px; color:#b91c1c;"><strong>Status:</strong> DRAFT / DO WERYFIKACJI — materiał lokalny do ręcznej weryfikacji, nie wysłany do klienta.</div>
     </header>

@@ -6,6 +6,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import List, Optional, Dict, Any
 from vtd.config import PipelineConfig
+from vtd.defaults import DEFAULT_ENRICH_MODEL
 from vtd.core.audio_extractor import extract_mic_audio, detect_silence, get_audio_stream_count
 from vtd.core.transcriber import Transcriber, SpeechSegment
 from vtd.core.frame_extractor import extract_scene_frames
@@ -48,7 +49,7 @@ def build_parser() -> argparse.ArgumentParser:
     run_cmd.add_argument("--track", choices=["mic", "mix", "meeting", "0", "1", "2", "auto"], default="mic", help="Ścieżka audio: mic (Track 2 - mikrofon lektora), mix (Track 1 - miks), meeting (Track 2 + Track 3 - dialog; Track 3 to Desktop/system audio — niezweryfikowany rozmówca), auto (auto-detekcja najlepszego toru)")
     run_cmd.add_argument("--mode", choices=["manual", "meeting"], default="manual", help="Tryb pracy: manual (instrukcja krok po kroku), meeting (protokół spotkania — nie instrukcja)")
     run_cmd.add_argument("--enrich", action="store_true", help="Wzbogać draft przez model LLM (OmniRoute) — wynik nadal DRAFT / DO WERYFIKACJI")
-    run_cmd.add_argument("--enrich-model", default="erp-manual", help="Model LLM w OmniRoute (np. erp-manual, antigravity/gemini-3.8-flash-tiered)")
+    run_cmd.add_argument("--enrich-model", default=DEFAULT_ENRICH_MODEL, help="Model LLM w bramce (GF-016: wspólny default z vtd.defaults; np. gpt-4o-mini)")
     # Metadane wejściowe — manual-first
     run_cmd.add_argument("--client", type=str, default=None, help="Nazwa klienta (jeśli brak: DO UZUPEŁNIENIA; nie wyciągaj z nazwy pliku)")
     run_cmd.add_argument("--process", type=str, default=None, help="Proces biznesowy (np. Sprzedaż, Produkcja)")
@@ -115,6 +116,14 @@ def _build_metadata(
     }
 
 
+class PipelineError(RuntimeError):
+    """GF-025: błąd pipeline jako biblioteki — zamiast sys.exit w głębi kodu.
+
+    Warstwa CLI (`main`) mapuje go na kod wyjścia 1; integratorzy (worker/Studio,
+    własne skrypty) dostają zwykły wyjątek, nie SystemExit.
+    """
+
+
 def run_pipeline(
     video_path: Path,
     output_dir: Path,
@@ -125,7 +134,7 @@ def run_pipeline(
     track: str = "mic",
     mode: str = "manual",
     enrich: bool = False,
-    enrich_model: str = "erp-manual",
+    enrich_model: str = DEFAULT_ENRICH_MODEL,
     client: Optional[str] = None,
     process: Optional[str] = None,
     module: Optional[str] = None,
@@ -143,8 +152,8 @@ def run_pipeline(
     nano_auto_accept: bool = False,
 ):
     if not video_path.exists():
-        print(f"BŁĄD: Plik wideo {video_path} nie istnieje!")
-        sys.exit(1)
+        # GF-025: raise PipelineError zamiast sys.exit(1) — exit tylko w warstwie CLI
+        raise PipelineError(f"Plik wideo {video_path} nie istnieje!")
 
     chosen_device, chosen_compute = resolve_device_and_compute(device)
 
@@ -182,10 +191,6 @@ def run_pipeline(
         try:
             from vtd.core.audio_detection import detect_best_track as _detect_best_track
             auto_detection = _detect_best_track(str(config.video_path))
-            # synchronizuj stream_count jeśli detekcja zwróciła inną liczbę
-            if auto_detection.get("n_streams", 0) > 0:
-                # zachowaj wartość z detekcji gdy różni się (ffprobe fallback)
-                pass
             best_idx = auto_detection.get("best_track_index")
             best_label = auto_detection.get("best_track_label", "mic")
             has_speech = auto_detection.get("has_speech")
@@ -210,9 +215,6 @@ def run_pipeline(
                 print(f"OSTRZEŻENIE auto-detekcji: {auto_detection.get('warning')}")
             if auto_detection.get("limited_to_120s"):
                 print("INFO: pomiary głośności/mowy ograniczone do pierwszych 120s nagrania")
-            if auto_detection.get("warning") and has_speech is not False and has_speech is not None:
-                # wątpliwe / weak bez has_speech False już obsłużone, ale pokaż warning jeśli istnieje
-                pass
         except Exception as e:
             print(f"OSTRZEŻENIE auto-detekcji: nie można zmierzyć toru ({e}) — użyto fallback mic")
             auto_detection = {
@@ -293,11 +295,22 @@ def run_pipeline(
             speaker_label = "Miks"
             desc = "Track 1 (Miks lektora i systemu)"
         elif track in ("2", "client", "desktop"):
-            chosen_track = 2 if stream_count > 2 else 0
+            if stream_count > 2:
+                chosen_track = 2
+            else:
+                # GF-008: jawne ostrzeżenie zamiast cichego fallbacku na tor miksu
+                chosen_track = 0
+                print(f"OSTRZEŻENIE: żądany Track 3 (Desktop/system) nie istnieje — nagranie ma tylko "
+                      f"{stream_count} strumień(y) audio. Cichy fallback na Track 1 (miks) może dać "
+                      f"transkrypcję z niewłaściwego toru!")
             speaker_label = SYSTEM_AUDIO_LABEL
             desc = f"Track 3 ({SYSTEM_AUDIO_LABEL})"
         else:
             chosen_track = 1 if stream_count > 1 else 0
+            if stream_count <= 1:
+                # GF-008: jawne ostrzeżenie gdy mikrofon lektora (Track 2) nie istnieje
+                print(f"OSTRZEŻENIE: Track 2 (mikrofon lektora) nie istnieje — nagranie ma tylko "
+                      f"{stream_count} strumień(y) audio. Użyto Track 1 (miks).")
             speaker_label = "Lektor"
             desc = "Track 2 (Mikrofon lektora)"
 
@@ -396,6 +409,10 @@ def run_pipeline(
                     # not reviewed due to limit
                     frame_qa_results.append({"step_number": s.step_number, "verdict": "skipped", "reason": "Limit MAX_REVIEWS", "action": "pozostawiono"})
                     continue
+                if frame_qa_reviews >= MAX_R:
+                    # GF-022: twardy limit — wcześniej pętla mogła po cichu przekroczyć MAX_REVIEWS
+                    frame_qa_results.append({"step_number": s.step_number, "verdict": "skipped", "reason": f"Twardy limit MAX_REVIEWS ({MAX_R}) osiągnięty", "action": "pozostawiono"})
+                    continue
                 # For reviewed steps, call reviewer
                 # Use step description: take first 500 chars of speech_text or enriched title later
                 step_title = f"Krok {s.step_number}"
@@ -470,7 +487,7 @@ def run_pipeline(
                 import re as _re
                 tokens = _re.findall(r"[\wąćęłńóśźżĄĆĘŁŃÓŚŹŻ]{3,}", raw_text)
                 # deduplicate preserving order, lowercase not yet; keep original case but also filter stopwords
-                stopwords = {"oraz", "przez", "jest", "oraz", "jest", "tego", "krok", "jest", "oraz", "będzie", "może", "dla", "oraz", "jest"}
+                stopwords = {"oraz", "przez", "jest", "tego", "krok", "będzie", "może", "dla"}
                 uniq = []
                 seen_low = set()
                 for tok in tokens:
@@ -486,7 +503,10 @@ def run_pipeline(
                 # If OCR found nothing, try fallback with broader words? located will be {}
                 title_for_llm = f"Krok {s.step_number}"
                 desc_for_llm = s.speech_text or ""
-                planned = plan_annotations(s.step_number, title_for_llm, desc_for_llm, located, llm_model="erp-code")
+                # DS-001: dawny martwy kwarg (llm_model nie istnieje w sygnaturze
+                # plan_annotations) wywalał TypeError połykany przez except — adnotacje
+                # AI nigdy nie powstawały. Bez kwargsa wybierany jest cfg.llm.element_locator_model.
+                planned = plan_annotations(s.step_number, title_for_llm, desc_for_llm, located)
                 # plan_annotations already enforces max 3
                 if not planned:
                     annotations_map[s.step_number] = []
@@ -524,11 +544,9 @@ def run_pipeline(
                 # Also handle grid frames? annotate grid frames similarly? spec says frames_annotated/scene_XXXX.png (lub grid_...)
                 # If step has grid_frames, we could annotate them similarly but skip for now (annotate only main frame)
                 try:
-                    annotated_img.convert("RGB").save(str(out_path), "PNG", compress_level=0)
-                    # Actually keep RGBA? PNG without lossy. Use compress_level 1 for not huge?
-                    # Save as PNG (Pillow will handle)
-                    if not out_path.exists():
-                        annotated_img.save(str(out_path), "PNG")
+                    # GF-026: jeden poziom kompresji PNG (compress_level=1 — jak w gridzie),
+                    # usunięto martwą gałąź `if not out_path.exists()` (plik właśnie zapisano).
+                    annotated_img.convert("RGB").save(str(out_path), "PNG", compress_level=1)
                 except Exception:
                     try:
                         annotated_img.save(str(out_path), "PNG")
@@ -542,7 +560,8 @@ def run_pipeline(
                     try:
                         g_img = load_frame(gf)
                         g_located = locate_words(gf, uniq)
-                        g_planned = plan_annotations(s.step_number, title_for_llm, desc_for_llm, g_located, llm_model="erp-code")
+                        # DS-001: j.w. — bez wymuszonego modelu, cfg decyduje
+                        g_planned = plan_annotations(s.step_number, title_for_llm, desc_for_llm, g_located)
                         if g_planned:
                             g_ann = annotate_frame(g_img, g_planned)
                             g_out = annotated_dir / gf.name
@@ -571,8 +590,7 @@ def run_pipeline(
 
     # ===== Etap 4: NANO BANANA (Gemini Flash Image) — enhancement/oznaczenia klatek =====
     nano_stats = {"enabled": False, "processed": 0, "accepted": 0, "rejected": 0, "cost_usd": 0.0, "details": []}
-    if 'enriched_data' not in locals():
-        enriched_data = None
+    enriched_data = None
     if nano_banana and mode == "manual":
         try:
             from vtd.core.image_enhancer import (
@@ -672,43 +690,37 @@ def run_pipeline(
     metadata["fusion_params"] = {"max_step_seconds": max_step_seconds, "grid_interval": grid_interval, "min_step_seconds": min_step_seconds}
     # Annotations metadata
     # annotate flag may have been disabled for meeting; ensure metadata reflects final state
-    metadata["annotate"] = bool(annotate and mode == "manual") if 'annotate' in locals() else False
-    metadata["annotations"] = annotations_per_step if 'annotations_per_step' in locals() else {}
-    metadata["annotated_frames"] = annotated_frames_count if 'annotated_frames_count' in locals() else 0
+    metadata["annotate"] = bool(annotate and mode == "manual")
+    metadata["annotations"] = annotations_per_step
+    metadata["annotated_frames"] = annotated_frames_count
     metadata["nano_banana"] = bool(nano_stats.get("enabled"))
     metadata["nano_banana_stats"] = nano_stats
-    metadata["annotations_detail"] = {str(k): [{"type": a.get("type"), "element": a.get("element"), "label": a.get("label"), "box": a.get("box")} for a in v] for k, v in (annotations_map.items() if 'annotations_map' in locals() else {})}
+    metadata["annotations_detail"] = {str(k): [{"type": a.get("type"), "element": a.get("element"), "label": a.get("label"), "box": a.get("box")} for a in v] for k, v in annotations_map.items()}
 
-    enriched_data = None
     qa_issues: List[str] = []
     if enrich:
         try:
             print(f"Wzbogacanie treści draftu przez model LLM ({enrich_model}) — tryb {mode}...")
             from vtd.core.enricher import enrich_steps_with_llm
-            # Pass frame QA context: add reason to steps for enricher prompt
-            # Enricher will read metadata frame_qa_results if available — we inject via steps extra attr
-            # Simplest: temporarily append reason to speech_text for enricher
-            if frame_qa and frame_qa_results:
-                qa_map = {r["step_number"]: r for r in frame_qa_results}
-                for s in steps:
-                    r = qa_map.get(s.step_number)
-                    if r and r.get("verdict") not in ("ok", "skipped"):
-                        # append one line context for LLM redaction
-                        s.speech_text = (s.speech_text + f" [Frame QA: {r['verdict']} — {r['reason']}]").strip()
+            # Pass frame QA context: GF-007 — QA idzie osobnym kanałem do promptu
+            # enrichera (frame_qa_results), NIE przez mutację step.speech_text.
             enriched_data = enrich_steps_with_llm(
-                title=title, steps=steps, model=enrich_model, timeout=180,
+                title=title, steps=steps, model=enrich_model,
                 client=client, process=process, module=module, environment=environment,
                 author=author, document_status=document_status, mode=mode,
+                frame_qa_results=frame_qa_results if frame_qa else None,
             )
             if enriched_data:
                 print("  -> Pomyślnie zredagowano draft przez LLM (status DRAFT / DO WERYFIKACJI).")
                 print("Bramka QA: Ograniczona kontrola spójności DRAFT (bez połączenia z bazą ERP)...")
                 from vtd.core.qa_verifier import audit_and_fix_manual
+                # DS-003: twardo zaszyty identyfikator modelu QA usunięty — nadpisywał
+                # cfg.llm.qa_verifier_model. Bez kwargsa qa_verifier wybiera model
+                # z konfiguracji (fallback wewnętrzny qa_verifier.py).
                 enriched_data, qa_issues = audit_and_fix_manual(
                     enriched_data=enriched_data,
                     steps=steps,
                     title=title,
-                    model="antigravity/gemini-3.8-flash-tiered"
                 )
                 if qa_issues:
                     print("  [QA AUDYT — DRAFT / DO WERYFIKACJI] Uwagi do ręcznej weryfikacji:")
@@ -830,12 +842,7 @@ def run_pipeline(
         comp_lines.append(f"- WYMAGA PODGLĄDU RĘCZNEGO: {need_preview} kroków")
 
     # Adnotacje sekcja
-    annotate_enabled = bool(annotate and mode == "manual") if 'annotate' in locals() else False
-    # ensure annotations_map available
-    if 'annotations_map' not in locals():
-        annotations_map = {}
-    if 'annotations_per_step' not in locals():
-        annotations_per_step = {}
+    annotate_enabled = bool(annotate and mode == "manual")
     comp_lines.extend([
         "",
         "## Adnotacje",
@@ -844,7 +851,7 @@ def run_pipeline(
         total_ann = sum(len(v) for v in annotations_map.values())
         comp_lines.append(f"- Kroki z adnotacjami: {sum(1 for v in annotations_map.values() if v)} / {len(steps)}")
         comp_lines.append(f"- Łącznie adnotacji: {total_ann}")
-        comp_lines.append(f"- Katalog: frames_annotated/ ({annotated_frames_count if 'annotated_frames_count' in locals() else 0} plików)")
+        comp_lines.append(f"- Katalog: frames_annotated/ ({annotated_frames_count} plików)")
         comp_lines.append("")
         comp_lines.append("| Krok | Adnotacje | Elementy |")
         comp_lines.append("|---|---|---|")
@@ -1013,7 +1020,7 @@ def run_pipeline(
     # 5. Prompt dla agenta
     prompt_text = build_llm_prompt(steps, module_title=title, mode=mode, metadata=metadata)
     # dopisek o adnotacjach
-    if 'annotations_map' in locals() and annotations_map and any(annotations_map.values()):
+    if annotations_map and any(annotations_map.values()):
         prompt_text += "\n\n[ADNOTACJE]: Klatki w frames_annotated/ zawierają adnotacje (strzałki, badge z numerami, highlight, dim). Odnieś się w opisie kroku do numerów na adnotacjach — np. '1 — Dodaj • 2 — Surowce' — i wyjaśnij każdy zaznaczony element. Numeracja badge odpowiada legendzie pod rysunkiem.\n"
     prompt_path = output_dir / "PROMPT_DLA_AGENTA.txt"
     prompt_path.write_text(prompt_text, encoding="utf-8")
@@ -1068,18 +1075,14 @@ def run_pipeline(
     manifest["artifacts"]["frames/"] = "client-ready"
     if frames_dir.exists():
         dest_frames = client_ready_dir / "frames"
-        if not dest_frames.exists():
-            try:
-                shutil.copytree(frames_dir, dest_frames, dirs_exist_ok=True)
-            except Exception:
-                pass
-        else:
-            try:
-                shutil.copytree(frames_dir, dest_frames, dirs_exist_ok=True)
-            except Exception:
-                pass
+        # GF-006: usunięto identyczne gałęzie if/else — copytree z dirs_exist_ok=True
+        # obsługuje oba przypadki.
+        try:
+            shutil.copytree(frames_dir, dest_frames, dirs_exist_ok=True)
+        except Exception:
+            pass
     # frames_annotated: internal + client-ready (główne obrazy kroków)
-    if 'annotated_dir' in locals() and annotated_dir.exists() and any(annotated_dir.iterdir()):
+    if annotated_dir.exists() and any(annotated_dir.iterdir()):
         manifest["artifacts"]["frames_annotated/"] = "client-ready"
         # też internal dla traceability
         dest_ann = client_ready_dir / "frames_annotated"
@@ -1098,11 +1101,11 @@ def run_pipeline(
         manifest["client-ready"].append("frames_annotated/")
         manifest["artifacts"]["frames_annotated/"] = "both"
     # enrich manifest stats with annotations
-    if 'annotations_per_step' in locals():
+    if annotations_per_step:
         manifest["annotations"] = annotations_per_step
-        manifest["annotated_frames"] = annotated_frames_count if 'annotated_frames_count' in locals() else 0
+        manifest["annotated_frames"] = annotated_frames_count
     # frames_enhanced (nano banana): internal zawsze; client-ready TYLKO zaakceptowane *_accepted
-    if 'nano_stats' in locals() and nano_stats.get("enabled"):
+    if nano_stats.get("enabled"):
         manifest["nano_banana"] = {
             "processed": nano_stats.get("processed", 0),
             "accepted": nano_stats.get("accepted", 0),
@@ -1158,39 +1161,53 @@ def main(argv=None):
     parser = build_parser()
     args = parser.parse_args(argv)
     if args.command == "run":
-        run_pipeline(
-            video_path=Path(args.video_path),
-            output_dir=Path(args.output),
-            title=args.title,
-            device=args.device,
-            model_size=args.model,
-            scene_threshold=args.scene_threshold,
-            track=args.track,
-            mode=args.mode,
-            enrich=args.enrich,
-            enrich_model=args.enrich_model,
-            client=getattr(args, "client", None),
-            process=getattr(args, "process", None),
-            module=getattr(args, "module", None),
-            environment=getattr(args, "environment", None),
-            author=getattr(args, "author", None),
-            document_status=getattr(args, "document_status", "DRAFT"),
-            output_mode=getattr(args, "output_mode", "both"),
-            max_step_seconds=getattr(args, "max_step_seconds", 45.0),
-            grid_interval=getattr(args, "grid_interval", 30.0),
-            frame_qa=getattr(args, "frame_qa", False),
-            annotate=getattr(args, "annotate", False),
-            nano_mode=getattr(args, "nano_mode", "located"),
-            nano_banana=getattr(args, "nano_banana", False),
-            nano_auto_accept=getattr(args, "nano_auto_accept", False),
-            min_step_seconds=getattr(args, "min_step_seconds", 6.0),
-        )
+        try:
+            run_pipeline(
+                video_path=Path(args.video_path),
+                output_dir=Path(args.output),
+                title=args.title,
+                device=args.device,
+                model_size=args.model,
+                scene_threshold=args.scene_threshold,
+                track=args.track,
+                mode=args.mode,
+                enrich=args.enrich,
+                enrich_model=args.enrich_model,
+                client=getattr(args, "client", None),
+                process=getattr(args, "process", None),
+                module=getattr(args, "module", None),
+                environment=getattr(args, "environment", None),
+                author=getattr(args, "author", None),
+                document_status=getattr(args, "document_status", "DRAFT"),
+                output_mode=getattr(args, "output_mode", "both"),
+                max_step_seconds=getattr(args, "max_step_seconds", 45.0),
+                grid_interval=getattr(args, "grid_interval", 30.0),
+                frame_qa=getattr(args, "frame_qa", False),
+                annotate=getattr(args, "annotate", False),
+                nano_mode=getattr(args, "nano_mode", "located"),
+                nano_banana=getattr(args, "nano_banana", False),
+                nano_auto_accept=getattr(args, "nano_auto_accept", False),
+                min_step_seconds=getattr(args, "min_step_seconds", 6.0),
+            )
+        except PipelineError as e:
+            # GF-025: exit tylko w warstwie CLI
+            print(f"BŁĄD: {e}")
+            sys.exit(1)
     elif args.command == "studio":
+        import logging
+        import os
         import uvicorn
         from vtd.config import load_config
         cfg = load_config()
         host = args.host or cfg.server.host
         port = args.port or cfg.server.port
+        # VTD-003: bez tokenu autoryzacji Studio binduje wyłącznie loopback
+        if not os.environ.get("VTD_AUTH_TOKEN", "").strip():
+            logging.getLogger("vtd.studio").warning(
+                "VTD_AUTH_TOKEN nie jest ustawiony — Studio nasłuchuje na 127.0.0.1 (host=%s pominięty). "
+                "Ustaw VTD_AUTH_TOKEN, aby nasłuchiwać na interfejsie publicznym.", host
+            )
+            host = "127.0.0.1"
         uvicorn.run("vtd.studio.app:app", host=host, port=port, reload=False)
     elif args.command == "rerender":
         from vtd.core.rerender_docs import rerender_output_dir

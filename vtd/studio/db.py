@@ -83,8 +83,8 @@ def create_task(data: Dict[str, Any]) -> int:
                     created_at, video_path, video_name, mode, client, process, module,
                     environment, author, document_status, output_mode, scene_threshold,
                     track, enrich, enrich_model, frame_qa, max_step_seconds, grid_interval,
-                    annotate, nano_banana, status, log_path
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'queued', ?)
+                    annotate, nano_banana, status, log_path, output_dir
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'queued', ?, ?)
                 """,
                 (
                     now,
@@ -108,6 +108,7 @@ def create_task(data: Dict[str, Any]) -> int:
                     1 if data.get("annotate") else 0,
                     1 if data.get("nano_banana") else 0,
                     data.get("log_path"),
+                    data.get("output_dir"),
                 ),
             )
             conn.commit()
@@ -138,10 +139,33 @@ def list_tasks(limit: int = 50) -> List[Dict[str, Any]]:
             conn.close()
 
 
+def list_tasks_by_status(status: str) -> List[Dict[str, Any]]:
+    """Zwraca wszystkie zadania o wskazanym statusie (kolejność rosnąca id)."""
+    init_db()
+    with _lock:
+        conn = get_connection()
+        try:
+            rows = conn.execute("SELECT * FROM tasks WHERE status = ? ORDER BY id ASC", (status,)).fetchall()
+            return [dict(r) for r in rows]
+        finally:
+            conn.close()
+
+
+# GF-018: mapa dozwolonych kolumn — SET budowany wyłącznie z tej listy (biała lista),
+# wartości nadal sparametryzowane przez `?`.
+_ALLOWED_TASK_COLUMNS = frozenset({
+    "status", "stage", "progress_note", "log_path", "output_dir",
+    "started_at", "finished_at", "error_tail",
+})
+
+
 def update_task(task_id: int, **fields: Any) -> None:
     init_db()
     if not fields:
         return
+    unknown = set(fields.keys()) - _ALLOWED_TASK_COLUMNS
+    if unknown:
+        raise ValueError(f"update_task: niedozwolone kolumny: {sorted(unknown)}")
     with _lock:
         conn = get_connection()
         try:

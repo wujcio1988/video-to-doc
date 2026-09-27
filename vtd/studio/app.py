@@ -1,18 +1,28 @@
 from fastapi import FastAPI, Request, Form, HTTPException, Query
 from fastapi.responses import HTMLResponse, JSONResponse, RedirectResponse, PlainTextResponse, StreamingResponse
+from urllib.parse import parse_qs
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from pathlib import Path
+from typing import Optional
+import html
 import json
+import logging
+import os
 import zipfile
 import io
 from datetime import datetime
 
-from vtd.studio.db import create_task, get_task, list_tasks, update_task
+from contextlib import asynccontextmanager
+
+from vtd.studio.db import create_task, get_task, list_tasks
 from vtd.studio.settings_store import load_settings, save_settings, ALLOWED_MODELS
+from vtd.defaults import DEFAULT_ENRICH_MODEL
+from vtd.studio.sanitize import render_markdown_safe
 from vtd.studio import worker
 
-app = FastAPI(title="Video-to-Doc Studio")
+logger = logging.getLogger("vtd.studio")
+
 BASE_DIR = Path(__file__).parent
 TEMPLATES_DIR = BASE_DIR / "templates"
 STATIC_DIR = BASE_DIR / "static"
@@ -21,10 +31,132 @@ RECORDINGS_DIR = load_config().storage.recordings_dir
 
 templates = Jinja2Templates(directory=str(TEMPLATES_DIR))
 
-# ensure worker poller started on startup
-@app.on_event("startup")
-async def on_startup():
+AUTH_TOKEN_ENV = "VTD_AUTH_TOKEN"
+# DS-010: /health (liveness), /login (ekran logowania dający cookie), /static/<plik>
+# (statyki niewrażliwe: style.css, app.js — przeglądarka nie wysyła nagłówka
+# X-VTD-Token do <link>/<img>, co łamało renderowanie UI przy włączonym tokenie).
+AUTH_EXEMPT_PATHS = {"/health", "/login"}
+AUTH_STATIC_PREFIX = "/static/"
+AUTH_COOKIE_NAME = "vtd_token"  # DS-010: sesja przeglądarki (HttpOnly, SameSite=Strict)
+
+
+def get_auth_token() -> str:
+    return os.environ.get(AUTH_TOKEN_ENV, "").strip()
+
+
+# GF-014: porównanie stało-czasowe (timing side-channel)
+def _token_matches(provided: str, expected: str) -> bool:
+    import hmac
+    return hmac.compare_digest(provided.encode("utf-8"), expected.encode("utf-8"))
+
+
+@asynccontextmanager
+async def lifespan(application: FastAPI):
+    # GF-015: migracja z deprecated @app.on_event("startup") na lifespan handler
+    if not get_auth_token():
+        logger.warning(
+            "VTD_AUTH_TOKEN nie jest ustawiony — Studio działa bez autoryzacji; "
+            "przy starcie przez CLI binduje 127.0.0.1. Ustaw VTD_AUTH_TOKEN dla dostępu sieciowego."
+        )
     worker.start_worker()
+    yield
+
+
+app = FastAPI(title="Video-to-Doc Studio", lifespan=lifespan)
+
+
+@app.middleware("http")
+async def require_auth_token(request: Request, call_next):
+    token = get_auth_token()
+    path = request.url.path
+    if not token or path in AUTH_EXEMPT_PATHS or path.startswith(AUTH_STATIC_PREFIX):
+        return await call_next(request)
+    # GF-014: token w query param pozostaje ODRZUCONY (wyciek do logów serwera
+    # i historii przeglądarki); porównanie stało-czasowe.
+    # DS-010: przeglądarka nie wysyła nagłówka X-VTD-Token ani do natywnych submitów
+    # formularzy, ani do fetch() — akceptujemy też cookie vtd_token (HttpOnly,
+    # SameSite=Strict blokuje cross-site), którego nadaje POST /login z poprawnym tokenem.
+    provided = request.headers.get("X-VTD-Token") or request.cookies.get(AUTH_COOKIE_NAME) or ""
+    if not _token_matches(provided, token):
+        # Przeglądarkowa nawigacja dostaje ekran logowania zamiast gołego JSON 401;
+        # API klienci (Accept: */*) dostają deterministyczne 401 jak dotychczas.
+        if request.method == "GET" and "text/html" in request.headers.get("accept", "") \
+                and not path.startswith("/api"):
+            return RedirectResponse(url="/login", status_code=303)
+        return JSONResponse(
+            {"detail": "Brak autoryzacji: podaj poprawny nagłówek X-VTD-Token lub zaloguj się na /login"},
+            status_code=401,
+        )
+    return await call_next(request)
+
+
+def _render_login_page(request: Request, error: bool, status_code: int = 200):
+    return templates.TemplateResponse(
+        request, "login.html", {"error": error}, status_code=status_code
+    )
+
+
+@app.get("/login", response_class=HTMLResponse)
+async def login_page(request: Request):
+    if not get_auth_token():
+        # tryb bez auth — ekran logowania niepotrzebny, prosto na dashboard
+        return RedirectResponse(url="/", status_code=303)
+    return _render_login_page(request, error=False)
+
+
+@app.post("/login")
+async def login_submit(request: Request):
+    """DS-010: logowanie dla przeglądarki — token w TREŚCI formularza (POST body),
+    nie w URL (GF-014 pozostaje niezmieniony). Ustala HttpOnly cookie używane przez
+    natywne formularze i fetch() jako poświadczenie sesji."""
+    expected = get_auth_token()
+    if not expected:
+        return RedirectResponse(url="/", status_code=303)
+    body = (await request.body()).decode("utf-8", errors="replace")
+    fields = parse_qs(body)
+    provided = (fields.get("token") or [""])[0].strip()
+    if not provided or not _token_matches(provided, expected):
+        return _render_login_page(request, error=True, status_code=401)
+    response = RedirectResponse(url="/", status_code=303)
+    response.set_cookie(
+        AUTH_COOKIE_NAME,
+        value=provided,
+        httponly=True,
+        samesite="strict",
+        path="/",
+    )
+    return response
+
+
+def resolve_video_path(video: str) -> Path:
+    """Waliduje ścieżkę pliku wideo: musi istnieć i leżeć wewnątrz RECORDINGS_DIR.
+
+    Odrzuca traversal (`..`), symlinki wychodzące poza katalog nagrań oraz
+    ścieżki absolutne spoza RECORDINGS_DIR. Rzuca HTTPException(400) przy odrzuceniu.
+    """
+    raw = (video or "").strip()
+    if not raw:
+        raise HTTPException(status_code=400, detail="Nie podano ścieżki pliku wideo")
+    root = RECORDINGS_DIR.resolve()
+    candidate = Path(raw)
+    if not candidate.is_absolute():
+        rel = RECORDINGS_DIR / raw
+        if rel.is_file():
+            candidate = rel
+        else:
+            candidate = RECORDINGS_DIR / candidate.name
+    try:
+        resolved = candidate.resolve()
+    except Exception:
+        raise HTTPException(status_code=400, detail=f"Nieprawidłowa ścieżka pliku wideo: {raw}")
+    if not resolved.is_relative_to(root):
+        raise HTTPException(
+            status_code=400,
+            detail=f"Ścieżka pliku wideo musi znajdować się w katalogu nagrań ({root}): {raw}",
+        )
+    if not resolved.is_file():
+        raise HTTPException(status_code=400, detail=f"Plik video nie istnieje: {raw}")
+    return resolved
 
 # mount static if exists
 if STATIC_DIR.exists():
@@ -82,23 +214,11 @@ async def new_task_form(request: Request, video: str = Query(default="")):
     settings = load_settings()
     # if video param given, try to validate exists
     video_exists = False
-    video_path_obj = None
     if video:
         try:
-            video_path_obj = Path(video)
-            if video_path_obj.exists() and video_path_obj.is_file():
-                video_exists = True
-            # also allow relative to recordings
-            elif (RECORDINGS_DIR / video).exists():
-                video_exists = True
-                video = str(RECORDINGS_DIR / video)
-            else:
-                # check if just filename
-                cand = RECORDINGS_DIR / Path(video).name
-                if cand.exists():
-                    video_exists = True
-                    video = str(cand)
-        except Exception:
+            video = str(resolve_video_path(video))
+            video_exists = True
+        except HTTPException:
             video_exists = False
     # auto-detekcja toru (limit 3s, nie blokuj UI)
     track_detect = None
@@ -106,11 +226,6 @@ async def new_task_form(request: Request, video: str = Query(default="")):
     if video_exists and video:
         try:
             import concurrent.futures as _cf
-            import sys as _sys
-            # ensure pipeline root on path
-            # PIPELINE_ROOT not needed
-            if str(PIPELINE_ROOT) not in _sys.path:
-                _sys.path.insert(0, str(PIPELINE_ROOT))
             from vtd.core.audio_detection import detect_best_track as _detect
             with _cf.ThreadPoolExecutor(max_workers=1) as ex:
                 fut = ex.submit(_detect, video)
@@ -147,7 +262,7 @@ async def create_task_endpoint(
     scene_threshold: str = Form(default="0.05"),
     track: str = Form(default="auto"),
     enrich: str = Form(default=""),
-    enrich_model: str = Form(default="artur-daily"),
+    enrich_model: Optional[str] = Form(default=None),
     frame_qa: str = Form(default=""),
     annotate: str = Form(default=""),
     nano_banana: str = Form(default=""),
@@ -159,19 +274,8 @@ async def create_task_endpoint(
     client = client.strip()
     if mode == "manual" and not client:
         raise HTTPException(status_code=400, detail="Klient wymagany dla trybu manual (instrukcja)")
-    # video must exist
-    vp = Path(video_path.strip())
-    # allow relative handling
-    if not vp.is_absolute():
-        # try recordings dir
-        cand = RECORDINGS_DIR / vp.name
-        if cand.exists():
-            vp = cand
-    if not vp.exists() or not vp.is_file():
-        # also try absolute path if provided but not exists => 400
-        raise HTTPException(status_code=400, detail=f"Plik video nie istnieje: {video_path}")
-    # ensure video is inside recordings or absolute existing (already checked)
-    # but also reject path traversal attempts outside? Already validated exists.
+    # video must exist and be inside RECORDINGS_DIR (anti-traversal)
+    vp = resolve_video_path(video_path)
 
     try:
         thr = float(scene_threshold)
@@ -187,6 +291,10 @@ async def create_task_endpoint(
     frame_qa_bool = bool(frame_qa and frame_qa not in ("0", "false", "off"))
     annotate_bool = bool(annotate and annotate not in ("0", "false", "off"))
     nano_banana_bool = bool(nano_banana and nano_banana not in ("0", "false", "off"))
+    # GF-016: walidacja modelu względem ALLOWED_MODELS, fallback na wspólny default
+    enrich_model = (enrich_model or "").strip() or DEFAULT_ENRICH_MODEL
+    if enrich_model not in ALLOWED_MODELS:
+        enrich_model = DEFAULT_ENRICH_MODEL
     # meeting mode disables annotate and nano_banana
     if mode == "meeting":
         annotate_bool = False
@@ -196,40 +304,35 @@ async def create_task_endpoint(
     # To respect settings default, if annotate field missing entirely, fall back to settings.
     # But FastAPI always provides default "" -> we already handled. If user unchecked, it will be False.
     if enrich_model not in ALLOWED_MODELS:
-        enrich_model = "artur-daily"
+        # GF-016: fallback na wspólny default (wcześniej "artur-daily" — model
+        # NIEBĘDĄCY na liście ALLOWED_MODELS, walidacja niczego nie chroniła)
+        enrich_model = DEFAULT_ENRICH_MODEL
 
     video_name = vp.name
-    # output dir and log path determined by worker
-    output_dir = str(worker.build_output_dir(client if client else None, mode))
-    # we create task; worker will ensure dir
+    # output_dir i log_path wylicza TYLKO worker (VTD-006) — bez podwójnego tworzenia katalogów
     settings = load_settings()
     # if annotate not explicitly sent (form checkbox unchecked = ""), respect? Already computed annotate_bool; but if settings annotate True and mode manual and user didn't touch, form sends "1" when checked. So ok.
-    task_id = create_task(
-        video_path=str(vp),
-        video_name=video_name,
-        mode=mode,
-        client=client if client else None,
-        process=process.strip() or None,
-        module=module.strip() or None,
-        environment=environment.strip() or None,
-        author=author.strip() or None,
-        document_status="DRAFT",
-        output_mode="both",
-        scene_threshold=thr,
-        track=track,
-        enrich=enrich_bool,
-        enrich_model=enrich_model if enrich_bool else None,
-        frame_qa=frame_qa_bool,
-        max_step_seconds=settings.get("max_step_seconds", 45.0),
-        grid_interval=settings.get("grid_interval", 30.0),
-        annotate=annotate_bool,
-        nano_banana=nano_banana_bool,
-        output_dir=output_dir,
-        log_path=str(BASE_DIR / f"task_{0}.log"),  # placeholder, will be updated
-    )
-    # fix log path with real id
-    log_path = str(BASE_DIR / f"task_{task_id}.log")
-    update_task(task_id, log_path=log_path)
+    task_id = create_task({
+        "video_path": str(vp),
+        "video_name": video_name,
+        "mode": mode,
+        "client": client if client else None,
+        "process": process.strip() or None,
+        "module": module.strip() or None,
+        "environment": environment.strip() or None,
+        "author": author.strip() or None,
+        "document_status": "DRAFT",
+        "output_mode": "both",
+        "scene_threshold": thr,
+        "track": track,
+        "enrich": enrich_bool,
+        "enrich_model": enrich_model if enrich_bool else None,
+        "frame_qa": frame_qa_bool,
+        "max_step_seconds": settings.get("max_step_seconds", 45.0),
+        "grid_interval": settings.get("grid_interval", 30.0),
+        "annotate": annotate_bool,
+        "nano_banana": nano_banana_bool,
+    })
 
     # enqueue
     worker.enqueue_task(task_id)
@@ -286,20 +389,13 @@ async def task_results(request: Request, task_id: int):
     client_ready_files = []
 
     if output_dir and output_dir.exists():
-        # markdown converter
-        try:
-            import markdown
-            md_convert = lambda text: markdown.markdown(text, extensions=["tables", "fenced_code"])
-        except Exception:
-            md_convert = lambda text: f"<pre>{text}</pre>"
-
         def load_md_as_html(path: Path):
             if path.exists():
                 text = path.read_text(encoding="utf-8", errors="ignore")
                 try:
-                    return md_convert(text), text
+                    return render_markdown_safe(text), text
                 except Exception:
-                    return f"<pre>{text}</pre>", text
+                    return f"<pre>{html.escape(text)}</pre>", text
             return "", ""
 
         instr_path = output_dir / "INSTRUKCJA.md"
@@ -371,19 +467,41 @@ async def task_download(task_id: int):
         raise HTTPException(status_code=404, detail="Katalog wyjściowy nie istnieje")
     client_ready_dir = output_dir / "client-ready"
     source_dir = client_ready_dir if client_ready_dir.exists() and any(client_ready_dir.iterdir()) else output_dir
-    zip_buffer = io.BytesIO()
-    with zipfile.ZipFile(zip_buffer, "w", zipfile.ZIP_DEFLATED) as zf:
-        for file_path in source_dir.rglob("*"):
-            if file_path.is_file():
-                if source_dir == output_dir and "frames" in file_path.parts:
-                    continue
-                if file_path.suffix.lower() == ".wav":
-                    continue
-                arcname = file_path.relative_to(source_dir)
-                zf.write(file_path, arcname)
-    zip_buffer.seek(0)
+    # GF-017: ZIP budowany na dysku tymczasowym i streamowany do odpowiedzi —
+    # wcześniej cały zip zbierał się w RAM procesu (io.BytesIO) — ryzyko OOM
+    # przy dużych nagraniach/klatkach.
+    import tempfile
+    tmp = tempfile.NamedTemporaryFile(prefix=f"vtd_task_{task_id}_", suffix=".zip", delete=False)
+    tmp.close()
+    try:
+        with zipfile.ZipFile(tmp.name, "w", zipfile.ZIP_DEFLATED) as zf:
+            for file_path in source_dir.rglob("*"):
+                if file_path.is_file():
+                    if source_dir == output_dir and "frames" in file_path.parts:
+                        continue
+                    if file_path.suffix.lower() == ".wav":
+                        continue
+                    arcname = file_path.relative_to(source_dir)
+                    zf.write(file_path, arcname)
+    except Exception:
+        Path(tmp.name).unlink(missing_ok=True)
+        raise
+
+    def _stream_and_cleanup():
+        with open(tmp.name, "rb") as f:
+            while True:
+                chunk = f.read(64 * 1024)
+                if not chunk:
+                    break
+                yield chunk
+        Path(tmp.name).unlink(missing_ok=True)
+
     filename = f"task_{task_id}_client_ready.zip"
-    return StreamingResponse(zip_buffer, media_type="application/zip", headers={"Content-Disposition": f'attachment; filename="{filename}"'})
+    return StreamingResponse(
+        _stream_and_cleanup(),
+        media_type="application/zip",
+        headers={"Content-Disposition": f'attachment; filename="{filename}"'},
+    )
 
 
 @app.get("/settings", response_class=HTMLResponse)
@@ -399,7 +517,7 @@ async def settings_get(request: Request):
 async def settings_post(
     request: Request,
     enrich: str = Form(default=""),
-    enrich_model: str = Form(default="artur-daily"),
+    enrich_model: Optional[str] = Form(default=None),
     scene_threshold: str = Form(default="0.05"),
     track: str = Form(default="auto"),
     author: str = Form(default=""),
@@ -409,7 +527,9 @@ async def settings_post(
 ):
     data = {}
     data["enrich"] = bool(enrich and enrich not in ("0", "false", "off"))
-    data["enrich_model"] = enrich_model if enrich_model in ALLOWED_MODELS else "artur-daily"
+    # GF-016: walidacja względem ALLOWED_MODELS, fallback na wspólny default
+    enrich_model = (enrich_model or "").strip() or DEFAULT_ENRICH_MODEL
+    data["enrich_model"] = enrich_model if enrich_model in ALLOWED_MODELS else DEFAULT_ENRICH_MODEL
     try:
         data["scene_threshold"] = float(scene_threshold)
     except Exception:
@@ -425,24 +545,9 @@ async def settings_post(
 
 @app.get("/api/track-detect")
 async def api_track_detect(video: str = Query(...)):
-    """JSON endpoint do auto-detekcji toru — ścieżka musi istnieć."""
-    vp = Path(video.strip())
-    if not vp.is_absolute():
-        cand = RECORDINGS_DIR / vp.name
-        if cand.exists():
-            vp = cand
-        else:
-            cand2 = RECORDINGS_DIR / video.strip()
-            if cand2.exists():
-                vp = cand2
-    if not vp.exists() or not vp.is_file():
-        raise HTTPException(status_code=400, detail=f"Plik video nie istnieje: {video}")
-    # sanitize: must exist — already checked
+    """JSON endpoint do auto-detekcji toru — ścieżka musi istnieć wewnątrz katalogu nagrań."""
+    vp = resolve_video_path(video)
     try:
-        import sys as _sys
-        # PIPELINE_ROOT not needed
-        if str(PIPELINE_ROOT) not in _sys.path:
-            _sys.path.insert(0, str(PIPELINE_ROOT))
         from vtd.core.audio_detection import detect_best_track as _detect
         import concurrent.futures as _cf
         with _cf.ThreadPoolExecutor(max_workers=1) as ex:

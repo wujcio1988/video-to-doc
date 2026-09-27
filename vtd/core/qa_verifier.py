@@ -4,7 +4,6 @@ Lokalny audyt spójności wygenerowanego szkicu instrukcji (DRAFT QA).
 from __future__ import annotations
 
 import json
-import re
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -26,12 +25,10 @@ def audit_and_fix_manual(
     """
     issues_found: List[str] = []
 
-    # 1. Sprawdzenie formatu liczb (np. '52,0000' vs '5200')
-    data_str = json.dumps(enriched_data, ensure_ascii=False)
-    if "5200" in data_str:
-        issues_found.append("KOREKTA LICZBOWA: Skorygowano format liczbowy ze skali tysięcznej do bazowej.")
-        data_str = re.sub(r"\b5200\b(?:\.00)?(?:\s*sztuk|\s*szt)?", "52 sztuki", data_str)
-        enriched_data = json.loads(data_str)
+    # GF-002: usunięto twardo zakodowaną podmianę "5200" -> "52 sztuki" na surowym
+    # JSON-stringu przed json.loads — cicho korupcjonowała legalne liczby 5200
+    # (kody produktów, kwoty, timestampy). Korekty liczb należą do promptu/walidacji
+    # LLM poniżej, nie do regexa na strumieniu JSON.
 
     cfg = load_config()
     chosen_model = model or cfg.llm.qa_verifier_model

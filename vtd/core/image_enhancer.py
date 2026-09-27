@@ -22,7 +22,9 @@ API_BASE = "https://generativelanguage.googleapis.com/v1beta/models"
 DEFAULT_MODEL = "cheaperinference/nano-banana-2"
 # Tryb composite przez OmniRoute (local gateway): JSON na /v1/images/generations
 # z image=dataURI; warstwa wraca jako b64_json (zwykle 1024x1024 -> compose robi resize).
-OMNIROUTE_BASE = "http://127.0.0.1:20128/v1"
+# GF-004: gateway/model/klucze konfigurowalne przez env — kod nie jest już na sztywno
+# związany z lokalną infrastrukturą autora.
+OMNIROUTE_BASE = os.environ.get("VTD_OMNIROUTE_BASE", "http://127.0.0.1:20128/v1")
 # Weryfikator celu: lancuch modeli — pierwszy hop erp-code (tani), fallback artur-daily
 # (gemini-3.8-flash). Combo erp-code po restarcie gatewaya moze trafic na hop tekstowy
 # (deepseek/kimi — bez widzenia); wtedy model zwraca BRAK_WIDZENIA i idzie nastepny.
@@ -39,8 +41,12 @@ FLAT_COST_PER_IMAGE = 0.025
 IMAGE_OUT_TOKEN_RATE_31 = 60.0 / 1e6
 
 _KEY_FILES = [
-    Path.home() / ".hermes" / ".env",
-    Path.home() / ".hermes" / "profiles" / "research" / ".env",
+    Path(p).expanduser()
+    for p in os.environ.get(
+        "VTD_KEY_FILES",
+        f"{Path.home() / '.hermes' / '.env'}:{Path.home() / '.hermes' / 'profiles' / 'research' / '.env'}",
+    ).split(":")
+    if p.strip()
 ]
 
 
@@ -325,70 +331,8 @@ def verify_target(
     raise EnhanceError(f"weryfikator celu niedostępny: {last_reason}")
 
 
-def enhance_frame(
-    frame_path,
-    api_key: str,
-    model: str = DEFAULT_MODEL,
-    step_text: str = "",
-    elements_hint: Optional[list] = None,
-    target_description: str = "",
-    timeout_s: int = 120,
-) -> EnhanceResult:
-    """Wyślij klatkę do nano banana, zapisz wynik jako <stem>_enh_raw.png obok oryginału (tmp)."""
-    frame_path = Path(frame_path)
-    img_b64 = base64.b64encode(frame_path.read_bytes()).decode()
-    url = f"{API_BASE}/{model}:generateContent?key={api_key}"
-    payload = {
-        "contents": [
-            {
-                "parts": [
-                    {"inline_data": {"mime_type": "image/png", "data": img_b64}},
-                    {"text": build_prompt(step_text, elements_hint, target_description)},
-                ]
-            }
-        ]
-    }
-    req = urllib.request.Request(
-        url, data=json.dumps(payload).encode(), headers={"Content-Type": "application/json"}
-    )
-    t0 = time.time()
-    try:
-        with _urlopen_with_retry(req, timeout=timeout_s) as r:
-            data = json.loads(r.read().decode())
-    except urllib.error.HTTPError as e:
-        detail = ""
-        try:
-            detail = e.read().decode()[:300]
-        except Exception:
-            pass
-        raise EnhanceError(f"HTTP {e.code}: {detail}") from e
-    except Exception as e:
-        raise EnhanceError(f"{type(e).__name__}: {e}") from e
-    latency = time.time() - t0
-
-    parts = data.get("candidates", [{}])[0].get("content", {}).get("parts", [])
-    out_bytes = None
-    for p in parts:
-        if "inlineData" in p and p["inlineData"].get("data"):
-            out_bytes = base64.b64decode(p["inlineData"]["data"])
-            break
-    if not out_bytes:
-        raise EnhanceError("brak obrazu w odpowiedzi modelu")
-
-    usage = data.get("usageMetadata", {})
-    tokens_in = int(usage.get("promptTokenCount", 0) or 0)
-    tokens_out = int(usage.get("candidatesTokenCount", 0) or 0)
-
-    out_path = frame_path.parent / (frame_path.stem + "_enh_raw.png")
-    out_path.write_bytes(out_bytes)
-    return EnhanceResult(
-        output_path=str(out_path),
-        model=model,
-        latency_s=latency,
-        tokens_in=tokens_in,
-        tokens_out=tokens_out,
-        cost_usd=_cost_for(model, tokens_out),
-    )
+# GF-004: usunięto martwą funkcję enhance_frame() (AI Studio path, nieużywana w flow CLI
+# — CLI woła enhance_frame_located/composite) — zostawiała plik <stem>_enh_raw.png w frames/.
 
 
 def _ocr_text(path) -> str:

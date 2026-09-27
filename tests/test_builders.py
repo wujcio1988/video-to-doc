@@ -44,3 +44,23 @@ def test_markdown_and_html_builders(tmp_path):
     html_content = html_out.read_text(encoding="utf-8")
     assert "<html" in html_content
     assert "Test Instrukcja" in html_content
+
+
+def test_gf001_regression_html_escaped(tmp_path):
+    """GF-001: tytuł/ASR z `<script>` NIE trafia raw do INSTRUKCJA.html (XSS)."""
+    from vtd.builders.html_builder import render_html_manual
+    from vtd.core.fusion import ManualStep
+
+    frame = tmp_path / "scene_0001.png"
+    frame.write_bytes(b"\x89PNG\r\n\x1a\n")
+    evil = '<script>alert(1)</script>'
+    steps = [ManualStep(step_number=1, start_time=0.0, end_time=5.0,
+                        frame_path=frame, speech_text=f"Opis {evil}")]
+    enriched = {"steps": [{"step_number": 1, "title": evil, "description": evil,
+                           "callout_type": "warning", "callout_text": evil}],
+                "intro": evil}
+    out = render_html_manual(title=evil, steps=steps, output_html=tmp_path / "INSTRUKCJA.html",
+                             metadata={"client": evil}, enriched_data=enriched)
+    html_text = Path(out).read_text(encoding="utf-8")
+    assert "<script>alert(1)</script>" not in html_text
+    assert "&lt;script&gt;" in html_text

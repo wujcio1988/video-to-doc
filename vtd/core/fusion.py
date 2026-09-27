@@ -255,11 +255,14 @@ def fuse_signals_into_steps_v2(
                             if res is not None:
                                 grid_path = res
                             else:
-                                # fallback placeholder path (not existing) but still record attempt?
                                 # spec says klatka kontrolna DODATKOWY DOWÓD — if extraction failed, no grid
                                 grid_path = None
+                                # GF-023: jawny komunikat zamiast cichego braku obrazka
+                                print(f"[FUSION] Ostrzeżenie: nie wycięto klatki siatkowej (t={t_grid:.1f}s) — krok BEZ gridu.")
                         except Exception:
                             grid_path = None
+                            # GF-023: jawny komunikat zamiast cichego braku obrazka w dokumencie
+                            print(f"[FUSION] Ostrzeżenie: ekstrakcja klatki siatkowej dla kroku (t={t_grid:.1f}s) nieudana — krok BEZ gridu.")
                     else:
                         # Without video_path, create placeholder logical path
                         # For test hermetyczny, create placeholder path without extraction
@@ -268,12 +271,6 @@ def fuse_signals_into_steps_v2(
                             grid_path = frames_dir / f"grid_{grid_idx:04d}.png"
                         else:
                             grid_path = Path(f"grid_{(len(steps)+1):04d}.png")
-                        # If we have video_path but no frames_dir handling above, fallback
-                        # Try placeholder if extraction not attempted, still add placeholder for test purposes
-                        # But in production with no video_path, tests expect grid_frames to be populated
-                        if grid_path is not None and video_path is not None and frames_dir is not None:
-                            # already handled
-                            pass
                     if grid_path is not None:
                         # If file doesn't exist and we are in placeholder mode (no video_path), still add path for test verification
                         # If extraction was attempted and failed, don't add
@@ -287,11 +284,6 @@ def fuse_signals_into_steps_v2(
                             elif frames_dir is None:
                                 grid_frames.append(grid_path)
                         # Alternative: when video_path is None we already appended, for video_path exists case we already checked
-                    else:
-                        # No grid_path determined (extraction failed) -> no grid
-                        pass
-                    # If we used placeholder mode, ensure grid_frames non-empty for long steps
-                    # For the case where video_path provided but extraction failed, we already logged warning
             # step_number will be reassigned later monotonically
             steps.append(ManualStep(
                 step_number=len(steps) + 1,

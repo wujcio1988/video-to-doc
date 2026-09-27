@@ -38,7 +38,8 @@ class Transcriber:
             str(wav_path),
             language=language,
             beam_size=5,
-            word_timestamps=True,
+            # GF-019: usunięto word_timestamps=True — słowa nigdzie nie były konsumowane,
+            # a generowanie word-level timestamps to czysty narzut czasu transkrypcji.
             vad_filter=True,
             vad_parameters=dict(min_silence_duration_ms=500, speech_pad_ms=200),
         )

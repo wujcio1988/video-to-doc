@@ -36,8 +36,17 @@ class LLMConfig(BaseModel):
         if val and val.strip():
             return val.strip()
 
-        # Popularne fallbacki zmiennych
-        for env_var in ("OPENAI_API_KEY", "OPENROUTER_API_KEY", "OMNIROUTE_API_KEY"):
+        # GF-009: klucz API sprzężony 1:1 z providerem (base_url) — klucz jednego
+        # serwisu nie jest już wysyłany do innego. Gateway lokalny (omniroute/localhost)
+        # akceptuje dodatkowo OPENAI_API_KEY jako klucz proxy.
+        base = (self.base_url or "").lower()
+        if "openrouter" in base:
+            candidates = ("OPENROUTER_API_KEY",)
+        elif "omniroute" in base or "127.0.0.1" in base or "localhost" in base:
+            candidates = ("OMNIROUTE_API_KEY", "OPENAI_API_KEY")
+        else:
+            candidates = ("OPENAI_API_KEY",)
+        for env_var in candidates:
             val = os.environ.get(env_var, "")
             if val and val.strip():
                 return val.strip()
@@ -115,6 +124,19 @@ class AppConfig(BaseModel):
     pipeline: PipelineConfig = Field(default_factory=PipelineConfig)
 
 
+# Wartości wstrzyknięte z plików .env — nie są "prawdziwymi" zmiennymi środowiskowymi
+# i NIE mogą nadpisywać wartości z jawnego pliku konfiguracji (VTD-029).
+_dotenv_injected: Dict[str, str] = {}
+
+
+def _is_real_env(name: str) -> bool:
+    """True jeśli zmienna pochodzi z realnego środowiska procesu, nie z pliku .env."""
+    if name not in os.environ:
+        return False
+    injected = _dotenv_injected.get(name)
+    return injected is None or os.environ[name] != injected
+
+
 def _load_env_file(path: Path) -> None:
     """Prosty loader pliku .env bez wymogu zewnętrznych bibliotek."""
     if not path.is_file():
@@ -130,6 +152,7 @@ def _load_env_file(path: Path) -> None:
             val = val.strip().strip("'\"")
             if key and key not in os.environ:
                 os.environ[key] = val
+                _dotenv_injected[key] = val
     except Exception:
         pass
 
@@ -169,46 +192,72 @@ def load_config(config_path: Optional[Path] = None) -> AppConfig:
                         cfg_dict = yaml.safe_load(cand.read_text(encoding="utf-8")) or {}
                         break
                     except ImportError:
-                        pass
-            except Exception:
-                pass
+                        # GF-005: ciche pomijanie zastąpione jawnym ostrzeżeniem —
+                        # w instalacji produkcyjnej (bez extras dev) plik YAML byłby ignorowany bez komunikatu.
+                        print(
+                            f"OSTRZEŻENIE: znaleziono plik konfiguracji YAML ({cand}), ale biblioteka "
+                            f"'pyyaml' nie jest zainstalowana — plik został POMINIĘTY. "
+                            f"Zainstaluj: pip install pyyaml (lub użyj konfiguracji JSON)."
+                        )
+            except Exception as e:
+                print(f"OSTRZEŻENIE: nie można wczytać pliku konfiguracji {cand}: {e}")
 
     cfg = AppConfig(**cfg_dict)
 
-    # Bezpośrednie nadpisywanie ze zmiennych środowiskowych (kluczowe dla Dockera)
-    base_url_env = os.environ.get("OPENAI_BASE_URL") or os.environ.get("OPENAI_API_BASE") or os.environ.get("VTD_BASE_URL")
-    if base_url_env and base_url_env.strip():
-        cfg.llm.base_url = base_url_env.strip()
+    # Nadpisywanie ze zmiennych środowiskowych (VTD-029).
+    # Precedencja: realna zmienna środowiskowa > plik konfiguracji > plik .env > domyślne.
+    # Wartości wstrzyknięte z pliku .env NIE nadpisują pól ustawionych w pliku konfiguracji.
+    def _file_set(*path: str) -> bool:
+        node: Any = cfg_dict
+        for key in path:
+            if not isinstance(node, dict) or key not in node or node[key] is None:
+                return False
+            node = node[key]
+        return True
 
-    api_key_env = os.environ.get("OPENAI_API_KEY") or os.environ.get("VTD_API_KEY")
-    if api_key_env and api_key_env.strip():
-        cfg.llm.api_key = api_key_env.strip()
+    def _env_pick(*names: str, file_path: tuple) -> Optional[str]:
+        for n in names:
+            if _is_real_env(n):
+                val = os.environ.get(n, "").strip()
+                if val:
+                    return val
+        if not _file_set(*file_path):
+            for n in names:
+                val = _dotenv_injected.get(n, "").strip()
+                if val:
+                    return val
+        return None
 
-    model_env = os.environ.get("OPENAI_MODEL") or os.environ.get("VTD_MODEL")
-    if model_env and model_env.strip():
-        m = model_env.strip()
-        cfg.llm.enricher_model = m
-        cfg.llm.frame_qa_model = m
-        cfg.llm.element_locator_model = m
-        cfg.llm.qa_verifier_model = m
+    base_url_env = _env_pick("OPENAI_BASE_URL", "OPENAI_API_BASE", "VTD_BASE_URL", file_path=("llm", "base_url"))
+    if base_url_env:
+        cfg.llm.base_url = base_url_env
 
-    port_env = os.environ.get("PORT") or os.environ.get("VTD_PORT")
-    if port_env and port_env.strip():
+    api_key_env = _env_pick("OPENAI_API_KEY", "VTD_API_KEY", file_path=("llm", "api_key"))
+    if api_key_env:
+        cfg.llm.api_key = api_key_env
+
+    for model_field in ("enricher_model", "frame_qa_model", "element_locator_model", "qa_verifier_model"):
+        model_env = _env_pick("OPENAI_MODEL", "VTD_MODEL", file_path=("llm", model_field))
+        if model_env:
+            setattr(cfg.llm, model_field, model_env)
+
+    port_env = _env_pick("PORT", "VTD_PORT", file_path=("server", "port"))
+    if port_env:
         try:
-            cfg.server.port = int(port_env.strip())
+            cfg.server.port = int(port_env)
         except ValueError:
             pass
 
-    host_env = os.environ.get("HOST") or os.environ.get("VTD_HOST")
-    if host_env and host_env.strip():
-        cfg.server.host = host_env.strip()
+    host_env = _env_pick("HOST", "VTD_HOST", file_path=("server", "host"))
+    if host_env:
+        cfg.server.host = host_env
 
-    rec_dir = os.environ.get("RECORDINGS_DIR") or os.environ.get("VTD_RECORDINGS_DIR")
-    if rec_dir and rec_dir.strip():
-        cfg.storage.recordings_dir = Path(rec_dir.strip())
+    rec_dir = _env_pick("RECORDINGS_DIR", "VTD_RECORDINGS_DIR", file_path=("storage", "recordings_dir"))
+    if rec_dir:
+        cfg.storage.recordings_dir = Path(rec_dir)
 
-    out_dir = os.environ.get("OUTPUT_DIR") or os.environ.get("VTD_OUTPUT_DIR")
-    if out_dir and out_dir.strip():
-        cfg.storage.output_dir = Path(out_dir.strip())
+    out_dir = _env_pick("OUTPUT_DIR", "VTD_OUTPUT_DIR", file_path=("storage", "output_dir"))
+    if out_dir:
+        cfg.storage.output_dir = Path(out_dir)
 
     return cfg

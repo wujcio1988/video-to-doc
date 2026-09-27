@@ -14,13 +14,18 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional
 
 from vtd.config import load_config
-from vtd.studio.db import get_task, update_task
+from vtd.studio.db import get_task, list_tasks_by_status, update_task
 from vtd.studio.settings_store import load_settings
 
 _queue_lock = threading.Lock()
 _queue: List[int] = []
 _worker_thread: Optional[threading.Thread] = None
 _running_task_id: Optional[int] = None
+_recover_lock = threading.Lock()
+_recovered = False
+
+TASK_TIMEOUT_SECONDS = 4 * 60 * 60
+TERMINATE_GRACE_SECONDS = 10.0
 
 
 def slugify(text: str) -> str:
@@ -57,10 +62,54 @@ def enqueue_task(task_id: int) -> None:
 def start_worker() -> None:
     """Uruchamia wątek roboczy kolejki zadań."""
     global _worker_thread
+    recover_tasks_on_startup()
     with _queue_lock:
         if _worker_thread is None or not _worker_thread.is_alive():
             _worker_thread = threading.Thread(target=_worker_loop, daemon=True)
             _worker_thread.start()
+
+
+def recover_tasks_on_startup() -> None:
+    """VTD-005: recovery po restarcie — przywraca spójność stanu zadań.
+
+    Zadania w statusie `running` (przerwane przez restart) są oznaczane jako `error`,
+    a zadania `queued` są ponownie dodawane do kolejki (wznowienie po restarcie).
+    """
+    global _recovered
+    with _recover_lock:
+        if _recovered:
+            return
+        _recovered = True
+    now = datetime.now(timezone.utc).isoformat()
+    for t in list_tasks_by_status("running"):
+        update_task(
+            t["id"],
+            status="error",
+            stage="failed",
+            error_tail="Zadanie przerwane przez restart workera",
+            finished_at=now,
+        )
+    for t in list_tasks_by_status("queued"):
+        enqueue_task(t["id"])
+
+
+def _terminate_process(proc: subprocess.Popen) -> None:
+    """VTD-004: kończy proces potomny — terminate(), po grace period kill()."""
+    try:
+        proc.terminate()
+    except Exception:
+        pass
+    try:
+        proc.wait(timeout=TERMINATE_GRACE_SECONDS)
+    except subprocess.TimeoutExpired:
+        try:
+            proc.kill()
+        except Exception:
+            pass
+        try:
+            proc.wait(timeout=TERMINATE_GRACE_SECONDS)
+        except Exception:
+            pass
 
 
 def _worker_loop() -> None:
@@ -103,8 +152,12 @@ def _execute_task(task_id: int) -> None:
         started_at=datetime.now(timezone.utc).isoformat(),
     )
 
-    output_dir = build_output_dir(task.get("client"), task.get("mode", "manual"))
-    update_task(task_id, output_dir=str(output_dir))
+    # VTD-006: output_dir wylicza i tworzy TYLKO worker (ew. już ustawiony w rekordzie)
+    if task.get("output_dir"):
+        output_dir = Path(task["output_dir"])
+    else:
+        output_dir = build_output_dir(task.get("client"), task.get("mode", "manual"))
+        update_task(task_id, output_dir=str(output_dir))
 
     cfg = load_config()
     settings = load_settings()
@@ -172,35 +225,55 @@ def _execute_task(task_id: int) -> None:
         )
 
         error_lines = []
-        for line in proc.stdout:
-            lf.write(line)
-            lf.flush()
-            error_lines.append(line)
-            if len(error_lines) > 50:
-                error_lines.pop(0)
 
-            # Mapowanie etapów
-            if "Krok 1/6" in line:
-                update_task(task_id, stage="audio", progress_note="Ekstrakcja toru audio")
-            elif "Krok 2/6" in line:
-                update_task(task_id, stage="silence", progress_note="Wykrywanie pauz w mowie")
-            elif "Krok 3/6" in line:
-                update_task(task_id, stage="transcription", progress_note="Transkrypcja mowy (Whisper)")
-            elif "Krok 4/6" in line:
-                update_task(task_id, stage="scenes", progress_note="Detekcja scen i wycinanie klatek")
-            elif "Krok 5/6" in line:
-                update_task(task_id, stage="dedup", progress_note="Deduplikacja percepcyjna pHash")
-            elif "Krok 6/6" in line:
-                update_task(task_id, stage="fusion", progress_note="Fuzja sygnałów i generowanie dokumentacji")
-            elif "Frame QA" in line:
-                update_task(task_id, stage="frame_qa", progress_note="Weryfikacja czytelności klatek")
-            elif "adnotacji AI" in line:
-                update_task(task_id, stage="annotations", progress_note="Generowanie adnotacji wizualnych")
+        def _pump_stdout() -> None:
+            for line in proc.stdout:
+                lf.write(line)
+                lf.flush()
+                error_lines.append(line)
+                if len(error_lines) > 50:
+                    error_lines.pop(0)
 
-        proc.wait()
+                # Mapowanie etapów
+                if "Krok 1/6" in line:
+                    update_task(task_id, stage="audio", progress_note="Ekstrakcja toru audio")
+                elif "Krok 2/6" in line:
+                    update_task(task_id, stage="silence", progress_note="Wykrywanie pauz w mowie")
+                elif "Krok 3/6" in line:
+                    update_task(task_id, stage="transcription", progress_note="Transkrypcja mowy (Whisper)")
+                elif "Krok 4/6" in line:
+                    update_task(task_id, stage="scenes", progress_note="Detekcja scen i wycinanie klatek")
+                elif "Krok 5/6" in line:
+                    update_task(task_id, stage="dedup", progress_note="Deduplikacja percepcyjna pHash")
+                elif "Krok 6/6" in line:
+                    update_task(task_id, stage="fusion", progress_note="Fuzja sygnałów i generowanie dokumentacji")
+                elif "Frame QA" in line:
+                    update_task(task_id, stage="frame_qa", progress_note="Weryfikacja czytelności klatek")
+                elif "adnotacji AI" in line:
+                    update_task(task_id, stage="annotations", progress_note="Generowanie adnotacji wizualnych")
+
+        pump = threading.Thread(target=_pump_stdout, daemon=True)
+        pump.start()
+
+        timed_out = False
+        try:
+            proc.wait(timeout=TASK_TIMEOUT_SECONDS)
+        except subprocess.TimeoutExpired:
+            timed_out = True
+            _terminate_process(proc)
+        pump.join(timeout=TERMINATE_GRACE_SECONDS)
 
     finished = datetime.now(timezone.utc).isoformat()
-    if proc.returncode == 0:
+    if timed_out:
+        err_tail = "".join(error_lines[-15:])
+        update_task(
+            task_id,
+            status="error",
+            stage="failed",
+            error_tail=f"Przekroczono limit czasu przetwarzania ({TASK_TIMEOUT_SECONDS:.0f}s); proces został przerwany.\n{err_tail}",
+            finished_at=finished,
+        )
+    elif proc.returncode == 0:
         update_task(
             task_id,
             status="done",

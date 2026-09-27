@@ -11,19 +11,26 @@ from typing import Dict, Any, List
 from vtd.cli import run_pipeline
 from vtd.builders.html_builder import render_html_manual
 from vtd.core.fusion import ManualStep
+from vtd.config import _load_env_file
 
-RECORDINGS_DIR = Path("/home/kozlo/erp-workspace/recordings")
+# GF-003: ścieżka nagrań konfigurowalna przez env (domyślnie względna, przenośna) —
+# wcześniej hard-coded /home/kozlo/erp-workspace/recordings.
+RECORDINGS_DIR = Path(os.environ.get("VTD_RECORDINGS_DIR", "./recordings")).expanduser()
 STATE_FILE = RECORDINGS_DIR / ".processed_recordings.json"
-ENV_FILE = Path.home() / ".hermes" / ".env"
+ENV_FILE = Path(os.environ.get("VTD_ENV_FILE", str(Path.home() / ".hermes" / ".env")))
+
+# VTD-011: limity czasu dla subprocess (ffprobe krótkie, curl/skrypt wysyłkowy)
+FFPROBE_TIMEOUT = 30.0
+CURL_TIMEOUT = 60.0
 
 def load_env() -> Dict[str, str]:
+    """GF-029: wspólny loader .env z vtd.config (bez duplikacji parsowania)."""
+    _load_env_file(ENV_FILE)
     env = {}
-    if ENV_FILE.exists():
-        for line in ENV_FILE.read_text(encoding="utf-8").splitlines():
-            line = line.strip()
-            if line and not line.startswith("#") and "=" in line:
-                k, v = line.split("=", 1)
-                env[k.strip()] = v.strip().strip("'\"")
+    for key in ("TELEGRAM_BOT_TOKEN", "HERMES_ARTIFACT_CHAT", "HERMES_ARTIFACT_THREAD"):
+        val = os.environ.get(key, "").strip()
+        if val:
+            env[key] = val
     return env
 
 def load_state() -> Dict[str, Any]:
@@ -58,7 +65,11 @@ def is_file_ready(file_path: Path, min_age_seconds: float = 8.0) -> bool:
             "-of", "default=noprint_wrappers=1:nokey=1",
             str(file_path)
         ]
-        res = subprocess.run(cmd, capture_output=True, text=True)
+        try:
+            res = subprocess.run(cmd, capture_output=True, text=True, timeout=FFPROBE_TIMEOUT)
+        except subprocess.TimeoutExpired:
+            print(f"[WATCHDOG] Błąd: ffprobe przekroczył limit czasu ({FFPROBE_TIMEOUT:.0f}s) dla {file_path.name}")
+            return False
         if res.returncode != 0 or not res.stdout.strip():
             return False
         return True
@@ -69,31 +80,53 @@ def is_file_ready(file_path: Path, min_age_seconds: float = 8.0) -> bool:
 def send_telegram_document(docx_path: Path, caption: str, env: Dict[str, str]):
     """Manual-only: wysyłka dostępna WYŁĄCZNIE gdy jawnie włączono --allow-telegram. Domyślnie NIE WYSYŁA."""
     bot_token = env.get("TELEGRAM_BOT_TOKEN")
-    chat_id = env.get("HERMES_ARTIFACT_CHAT", "6989419513")
+    chat_id = env.get("HERMES_ARTIFACT_CHAT", "")
     thread_id = env.get("HERMES_ARTIFACT_THREAD")
     if not bot_token or not docx_path.exists():
         return
+    if not chat_id:
+        # GF-003: brak hard-coded chat_id — bez jawnego adresata wysyłka nie rusza
+        print("[WATCHDOG] Ostrzeżenie: brak HERMES_ARTIFACT_CHAT w env — pomijam wysyłkę Telegram.")
+        return
+    # DS-002 (GF-003 regresja): Telegram Bot API wymaga tokenu w ścieżce
+    # /bot<TOKEN>/sendDocument i NIE obsługuje nagłówka Authorization (zweryfikowane:
+    # GET /bot/getMe z Bearer → 404). Token w argv curl to znany kompromis API —
+    # argv procesu może być widoczne w /proc, ale zabezpiecza plik env (utaj w procesie
+    # nie występuje). Nie zamieniać z powrotem na nagłówek.
     cmd = [
         "curl", "-s",
         "-F", f"chat_id={chat_id}",
         "-F", f"caption={caption}",
         "-F", f"document=@{docx_path}",
-        f"https://api.telegram.org/bot{bot_token}/sendDocument"
+        f"https://api.telegram.org/bot{bot_token}/sendDocument",
     ]
     if thread_id and thread_id != "none":
         cmd.extend(["-F", f"message_thread_id={thread_id}"])
-    res = subprocess.run(cmd, capture_output=True, text=True)
+    try:
+        res = subprocess.run(cmd, capture_output=True, text=True, timeout=CURL_TIMEOUT)
+    except subprocess.TimeoutExpired:
+        print(f"[WATCHDOG] Błąd: wysyłka na Telegram przekroczyła limit czasu ({CURL_TIMEOUT:.0f}s): {docx_path.name}")
+        return
     if res.returncode == 0 and '"ok":true' in res.stdout:
         print(f"[WATCHDOG] Wysłano dokument Word na Telegram: {docx_path.name}")
     else:
         print(f"[WATCHDOG] Ostrzeżenie: wysyłka na Telegram nie powiodła się: {res.stdout}")
 
 def send_telegram_artifact(html_path: Path, title: str):
-    """Manual-only: wysyłka dostępna WYŁĄCZNIE gdy jawnie włączono --allow-telegram."""
+    """Manual-only: wysyłka dostępna WYŁĄCZNIE gdy jawnie włączono --allow-telegram.
+
+    DS-002: ta ścieżka deleguje do zewnętrznego hermes-send-artifact.sh,
+    który przekazuje token Bot API w ścieżce URL (bot${BOT_TOKEN}/sendMessage)
+    — zgodnie z wymogiem API; nagłówek Authorization nie jest tu używany.
+    """
     script = Path.home() / ".hermes" / "artifacts-server" / "scripts" / "hermes-send-artifact.sh"
     if script.exists() and html_path.exists():
         cmd = [str(script), str(html_path), title]
-        res = subprocess.run(cmd, capture_output=True, text=True)
+        try:
+            res = subprocess.run(cmd, capture_output=True, text=True, timeout=CURL_TIMEOUT)
+        except subprocess.TimeoutExpired:
+            print(f"[WATCHDOG] Błąd: wysyłka artefaktu przekroczyła limit czasu ({CURL_TIMEOUT:.0f}s): {title}")
+            return
         if res.returncode == 0:
             print(f"[WATCHDOG] Wystawiono i wysłano Telegram Mini App: {title}")
 

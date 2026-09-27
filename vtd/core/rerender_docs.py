@@ -88,6 +88,27 @@ def _parse_steps_from_prompt(output_dir: Path) -> List[ManualStep]:
     return steps
 
 
+def _timestamps_from_prompt(output_dir: Path) -> Dict[str, tuple]:
+    """GF-013: mapa frame_name -> (start, end) z PROMPT_DLA_AGENTA.txt."""
+    prompt_path = output_dir / "PROMPT_DLA_AGENTA.txt"
+    if not prompt_path.exists():
+        return {}
+    try:
+        text = prompt_path.read_text(encoding="utf-8", errors="ignore")
+    except OSError:
+        return {}
+    result: Dict[str, tuple] = {}
+    for m in re.finditer(
+        r"---\s*KROK\s+\d+.*?Znacznik:\s*([0-9.]+)s\s*-\s*([0-9.]+)s.*?klatka:\s*([^\s|]+)",
+        text, re.IGNORECASE | re.DOTALL,
+    ):
+        try:
+            result[Path(m.group(3).strip()).name] = (float(m.group(1)), float(m.group(2)))
+        except ValueError:
+            continue
+    return result
+
+
 def _parse_steps_from_existing_markdown(output_dir: Path) -> tuple[List[ManualStep], Dict[int, Dict[str, str]]]:
     md_path = output_dir / "INSTRUKCJA.md"
     if not md_path.exists():
@@ -95,6 +116,10 @@ def _parse_steps_from_existing_markdown(output_dir: Path) -> tuple[List[ManualSt
     text = md_path.read_text(encoding="utf-8", errors="ignore")
     steps: List[ManualStep] = []
     enriched: Dict[int, Dict[str, str]] = {}
+    # GF-013: builder INSTRUKCJA.md nie emituje linii "Dowód" — znaczniki czasu
+    # rekonstruujemy z PROMPT_DLA_AGENTA.txt (jedyny serializer z Dowód/klatka/timestamp)
+    # zamiast fabrykować 0-5s.
+    prompt_ts = _timestamps_from_prompt(output_dir)
     # Find all Krok headings and following Dowód
     # Use regex to iterate
     heading_pat = re.compile(r"###\s*Krok\s+(\d+):\s*(.*?)\n")
@@ -126,7 +151,14 @@ def _parse_steps_from_existing_markdown(output_dir: Path) -> tuple[List[ManualSt
             img_m = re.search(r"!\[Krok\s*\d+\]\(([^)]+)\)", block)
             frame_name = Path(img_m.group(1)).name if img_m else f"scene_{num:04d}.png"
             frame_path = output_dir / "frames" / frame_name
-            steps.append(ManualStep(step_number=num, start_time=0.0, end_time=5.0, frame_path=frame_path, speech_text=""))
+            # GF-013: rekonstrukcja timestampów z promptu zamiast sfabrykowanych 0-5s
+            if frame_name in prompt_ts:
+                start_t, end_t = prompt_ts[frame_name]
+            else:
+                start_t, end_t = 0.0, 5.0
+                print(f"[RERENDER] Ostrzeżenie: brak znaczników czasu dla klatki {frame_name} "
+                      f"(ani Dowód w md, ani PROMPT_DLA_AGENTA.txt) — użyto fallback 0-5s.")
+            steps.append(ManualStep(step_number=num, start_time=start_t, end_time=end_t, frame_path=frame_path, speech_text=""))
             if title:
                 enriched[num] = {"title": title}
     # Also handle case where heading has no colon title (clean new format) -> heading_pat won't match, try alternative

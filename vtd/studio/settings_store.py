@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Any, Dict
 
 from vtd.config import load_config
+from vtd.defaults import DEFAULT_ENRICH_MODEL
 
 _lock = threading.Lock()
 
@@ -25,7 +26,7 @@ ALLOWED_MODELS = DEFAULT_MODELS
 
 DEFAULTS: Dict[str, Any] = {
     "enrich": False,
-    "enrich_model": "gpt-4o-mini",
+    "enrich_model": DEFAULT_ENRICH_MODEL,
     "scene_threshold": 0.05,
     "track": "auto",
     "author": "",

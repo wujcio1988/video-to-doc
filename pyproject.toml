@@ -35,13 +35,17 @@ dependencies = [
     "jinja2>=3.1.0",
     "python-multipart>=0.0.6",
     "markdown>=3.4.0",
+    "bleach>=6.0.0",
+    # GF-005: pyyaml w zależnościach podstawowych — config.yaml musi działać
+    # także w instalacji produkcyjnej (pip install .), nie tylko w dev.
+    "pyyaml>=6.0.0",
 ]
 
 [project.optional-dependencies]
 dev = [
     "pytest>=7.0.0",
     "httpx>=0.24.0",
-    "pyyaml>=6.0.0",
+    "ruff>=0.4.0",
 ]
 
 [project.scripts]
