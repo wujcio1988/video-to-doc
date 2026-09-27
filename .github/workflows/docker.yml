@@ -38,6 +38,24 @@ jobs:
         run: |
           pytest -v
 
+  lint:
+    # GF-030: lint w CI — wybrane reguły ruff (błędy składni/fatal + undefined names),
+    # żeby martwe gałęzie i literówki nie wracały.
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Run ruff (selected rules)
+        run: |
+          pipx install ruff
+          ruff check vtd tests --select E9,F63,F7,F82
+
   build-and-push:
     needs: test
     runs-on: ubuntu-latest

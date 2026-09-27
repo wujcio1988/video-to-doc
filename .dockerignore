@@ -15,3 +15,7 @@ tests/
 *.mkv
 *.mp4
 *.bak*
+# DS-004: lokalne pliki .env (klucze) NIE mogą trafiać do warstwy obrazu Docker
+.env
+*.env
+.env.*

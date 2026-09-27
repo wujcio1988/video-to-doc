@@ -16,6 +16,10 @@ services:
       - OPENAI_BASE_URL=${OPENAI_BASE_URL:-https://api.openai.com/v1}
       - OPENAI_MODEL=${OPENAI_MODEL:-}
       - OPENROUTER_API_KEY=${OPENROUTER_API_KEY:-}
+      # VTD-003: token autoryzacji Studio — WYMAGANY.
+      # Bez niego Studio binduje 127.0.0.1 w kontenerze (brak dostępu z sieci).
+      # Ustaw VTD_AUTH_TOKEN w pliku .env (patrz .env.example) lub w środowisku hosta.
+      - VTD_AUTH_TOKEN=${VTD_AUTH_TOKEN:?VTD_AUTH_TOKEN jest wymagany — ustaw go w .env}
     volumes:
       - ./recordings:/app/recordings
       - ./output:/app/output
