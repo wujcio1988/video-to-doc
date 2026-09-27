@@ -7,6 +7,7 @@ from __future__ import annotations
 import base64
 import json
 import mimetypes
+import random
 import re
 import time
 import urllib.error
@@ -96,7 +97,11 @@ class OpenAIProvider(BaseLLMProvider):
         data_bytes = json.dumps(payload).encode("utf-8")
         headers = self._get_headers()
 
-        last_error = None
+        # VTD-027: retry wyłącznie dla błędów przejściowych (sieć / 429 / 5xx).
+        # Błędy logiczne (np. ValueError sparsowania odpowiedzi, HTTPError 4xx
+        # poza rate-limitem) NIE podlegają retry — powtarzanie ich to bezsens i
+        # ukrywanie prawdziwej przyczyny. Backoff wykładniczy z jitterem.
+        last_error: Optional[Exception] = None
         for attempt in range(self.max_retries + 1):
             try:
                 req = urllib.request.Request(self.chat_url, data=data_bytes, headers=headers)
@@ -104,6 +109,7 @@ class OpenAIProvider(BaseLLMProvider):
                     resp_data = json.loads(resp.read().decode("utf-8"))
                     choices = resp_data.get("choices", [])
                     if not choices:
+                        # Błąd walidacji odpowiedzi — permanentny, bez retry.
                         raise ValueError(f"Brak choices w odpowiedzi LLM: {resp_data}")
                     content = choices[0].get("message", {}).get("content", "")
                     return content or ""
@@ -113,20 +119,27 @@ class OpenAIProvider(BaseLLMProvider):
                     err_body = e.read().decode("utf-8", errors="ignore")
                 except Exception:
                     pass
+                transitory = e.code == 429 or 500 <= e.code <= 599
                 last_error = RuntimeError(f"Błąd HTTP {e.code} ({e.reason}): {err_body[:300]}")
-                # 429 lub 5xx -> retry
-                if e.code in (429, 500, 502, 503, 504) and attempt < self.max_retries:
-                    time.sleep(1.5 ** attempt)
+                if transitory and attempt < self.max_retries:
+                    time.sleep(self._backoff_seconds(attempt))
                     continue
                 raise last_error
-            except Exception as e:
+            except (urllib.error.URLError, ConnectionError, TimeoutError, OSError) as e:
+                # Błędy sieciowe (DNS, refused, reset, timeout) — transitoryczne.
                 last_error = e
                 if attempt < self.max_retries:
-                    time.sleep(1.5 ** attempt)
+                    time.sleep(self._backoff_seconds(attempt))
                     continue
                 raise last_error
 
         raise RuntimeError(f"Przekroczono limit prób wywołania LLM: {last_error}")
+
+    def _backoff_seconds(self, attempt: int) -> float:
+        """Exponential backoff z ograniczeniem i jitterem (±25%)."""
+        base = min(2.0 ** attempt, 32.0)
+        jitter = random.Random(time.monotonic_ns() + attempt).uniform(0.75, 1.25)
+        return base * jitter
 
     def chat_completion(
         self,

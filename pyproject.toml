@@ -39,6 +39,10 @@ dependencies = [
     # GF-005: pyyaml w zależnościach podstawowych — config.yaml musi działać
     # także w instalacji produkcyjnej (pip install .), nie tylko w dev.
     "pyyaml>=6.0.0",
+    # VTD-021: numpy importowany bezpośrednio przez vtd/core/frame_sharpness.py
+    # (Laplace-based wyostrzanie) — musi być jawną zależnością, nie tylko
+    # pośrednią przez imagehash/faster-whisper.
+    "numpy>=1.24.0",
 ]
 
 [project.optional-dependencies]

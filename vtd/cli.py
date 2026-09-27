@@ -124,134 +124,96 @@ class PipelineError(RuntimeError):
     """
 
 
-def run_pipeline(
-    video_path: Path,
-    output_dir: Path,
-    title: str,
-    device: str = "auto",
-    model_size: str = "large-v3",
-    scene_threshold: Optional[float] = None,
-    track: str = "mic",
-    mode: str = "manual",
-    enrich: bool = False,
-    enrich_model: str = DEFAULT_ENRICH_MODEL,
-    client: Optional[str] = None,
-    process: Optional[str] = None,
-    module: Optional[str] = None,
-    environment: Optional[str] = None,
-    author: Optional[str] = None,
-    document_status: str = "DRAFT",
-    output_mode: str = "both",
-    max_step_seconds: float = 45.0,
-    grid_interval: float = 30.0,
-    frame_qa: bool = False,
-    min_step_seconds: float = 6.0,
-    annotate: bool = False,
-    nano_banana: bool = False,
-    nano_mode: str = "located",
-    nano_auto_accept: bool = False,
-):
-    if not video_path.exists():
-        # GF-025: raise PipelineError zamiast sys.exit(1) — exit tylko w warstwie CLI
-        raise PipelineError(f"Plik wideo {video_path} nie istnieje!")
+def _emit_progress(stage: str, step: Optional[int] = None, total: Optional[int] = None, note: Optional[str] = None) -> None:
+    """VTD-012: emisja ustrukturyzowanego znacznika postępu na stdout.
 
-    chosen_device, chosen_compute = resolve_device_and_compute(device)
+    Format: `##VTD_PROGRESS:{"stage": ..., "step": ..., "total": ..., "note": ...}`
+    Studio worker parsuje tę linię i ustawia stage/progress_note zadania.
+    Zwykłe komunikaty (print Krok N/6) zostają bez zmian dla człowieka.
+    """
+    payload: Dict[str, Any] = {"stage": stage}
+    if step is not None:
+        payload["step"] = step
+    if total is not None:
+        payload["total"] = total
+    if note:
+        payload["note"] = note
+    print(f"##VTD_PROGRESS:{json.dumps(payload, ensure_ascii=False)}")
 
-    if scene_threshold is not None:
-        config = PipelineConfig(
-            video_path=video_path,
-            output_dir=output_dir,
-            document_title=title,
-            whisper_device=chosen_device,
-            whisper_compute_type=chosen_compute,
-            whisper_model=model_size,
-            scene_threshold=scene_threshold
-        )
-    else:
-        config = PipelineConfig(
-            video_path=video_path,
-            output_dir=output_dir,
-            document_title=title,
-            whisper_device=chosen_device,
-            whisper_compute_type=chosen_compute,
-            whisper_model=model_size
-        )
 
-    output_dir.mkdir(parents=True, exist_ok=True)
-    frames_dir = output_dir / "frames"
-    wav_path = output_dir / "mic_isolated.wav"
+def _stage_auto_detect(config, track: str, stream_count: int):
+    """Etap auto-detekcji toru audio (track == 'auto') — zachowanie 1:1 (VTD-018)."""
+    auto_detection: Optional[Dict[str, Any]] = None
+    if track != "auto":
+        return auto_detection
     try:
-        stream_count = get_audio_stream_count(config.video_path)
-    except Exception:
-        stream_count = 1
+        from vtd.core.audio_detection import detect_best_track as _detect_best_track
+        auto_detection = _detect_best_track(str(config.video_path))
+        best_idx = auto_detection.get("best_track_index")
+        best_label = auto_detection.get("best_track_label", "mic")
+        has_speech = auto_detection.get("has_speech")
+        # znajdź mean_volume dla best toru
+        mean_vol_str = "n/a"
+        if best_idx is not None:
+            for t in auto_detection.get("tracks", []):
+                if t.get("index") == best_idx:
+                    mean_vol_str = f"{t.get('mean_volume_db')} dB"
+                    break
+            # numer toru dla użytkownika: 1-based (Track N)
+            track_num = best_idx + 1
+            print(f"Track auto-detekcja: wybrano Track {track_num} ({best_label}, mean_volume {mean_vol_str})")
+        else:
+            # fallback gdy brak mowy -> wybierzemy tor 2 (mic) lub 1
+            fallback_idx = 1 if stream_count > 1 else 0
+            fallback_label = "mic" if fallback_idx == 1 else "mix"
+            print(f"Track auto-detekcja: wybrano Track {fallback_idx+1} ({fallback_label}, fallback — brak wykrywalnej mowy)")
+        if has_speech is False:
+            print("OSTRZEŻENIE: Brak wykrywalnej narracji w nagraniu — dokument powstanie tylko z OCR klatek")
+        elif has_speech is None and auto_detection.get("warning"):
+            print(f"OSTRZEŻENIE auto-detekcji: {auto_detection.get('warning')}")
+        if auto_detection.get("limited_to_120s"):
+            print("INFO: pomiary głośności/mowy ograniczone do pierwszych 120s nagrania")
+    except Exception as e:
+        print(f"OSTRZEŻENIE auto-detekcji: nie można zmierzyć toru ({e}) — użyto fallback mic")
+        auto_detection = {
+            "n_streams": stream_count,
+            "best_track_index": None,
+            "best_track_label": "mic",
+            "tracks": [],
+            "has_speech": None,
+            "warning": f"nie można zmierzyć — błąd detekcji: {e}",
+            "limited_to_120s": False,
+        }
+    return auto_detection
 
-    # Auto-detekcja toru audio (track == "auto")
-    auto_detection = None
-    if track == "auto":
-        try:
-            from vtd.core.audio_detection import detect_best_track as _detect_best_track
-            auto_detection = _detect_best_track(str(config.video_path))
-            best_idx = auto_detection.get("best_track_index")
-            best_label = auto_detection.get("best_track_label", "mic")
-            has_speech = auto_detection.get("has_speech")
-            # znajdź mean_volume dla best toru
-            mean_vol_str = "n/a"
-            if best_idx is not None:
-                for t in auto_detection.get("tracks", []):
-                    if t.get("index") == best_idx:
-                        mean_vol_str = f"{t.get('mean_volume_db')} dB"
-                        break
-                # numer toru dla użytkownika: 1-based (Track N)
-                track_num = best_idx + 1
-                print(f"Track auto-detekcja: wybrano Track {track_num} ({best_label}, mean_volume {mean_vol_str})")
-            else:
-                # fallback gdy brak mowy -> wybierzemy tor 2 (mic) lub 1
-                fallback_idx = 1 if stream_count > 1 else 0
-                fallback_label = "mic" if fallback_idx == 1 else "mix"
-                print(f"Track auto-detekcja: wybrano Track {fallback_idx+1} ({fallback_label}, fallback — brak wykrywalnej mowy)")
-            if has_speech is False:
-                print("OSTRZEŻENIE: Brak wykrywalnej narracji w nagraniu — dokument powstanie tylko z OCR klatek")
-            elif has_speech is None and auto_detection.get("warning"):
-                print(f"OSTRZEŻENIE auto-detekcji: {auto_detection.get('warning')}")
-            if auto_detection.get("limited_to_120s"):
-                print("INFO: pomiary głośności/mowy ograniczone do pierwszych 120s nagrania")
-        except Exception as e:
-            print(f"OSTRZEŻENIE auto-detekcji: nie można zmierzyć toru ({e}) — użyto fallback mic")
-            auto_detection = {
-                "n_streams": stream_count,
-                "best_track_index": None,
-                "best_track_label": "mic",
-                "tracks": [],
-                "has_speech": None,
-                "warning": f"nie można zmierzyć — błąd detekcji: {e}",
-                "limited_to_120s": False,
-            }
 
-    print(f"=== Rozpoczęcie przetwarzania nagrania: {video_path.name} ===")
-    print(f"Konfiguracja: urządzenie={config.whisper_device} ({config.whisper_compute_type}), model={config.whisper_model}, tryb={mode}, ścieżki_audio={stream_count}")
-    print(f"Metadane: klient={client or 'DO UZUPEŁNIENIA'} | proces={process or 'DO UZUPEŁNIENIA'} | moduł={module or 'DO UZUPEŁNIENIA'} | env={environment or 'DO UZUPEŁNIENIA'} | status={document_status} | output={output_mode}")
+def _stage_audio_and_transcribe(
+    config,
+    output_dir: Path,
+    wav_path: Path,
+    transcriber,
+    track: str,
+    mode: str,
+    stream_count: int,
+    auto_detection: Optional[Dict[str, Any]],
+):
+    """Etap 1/6–3/6: audio extraction + wykrywanie pauz + transkrypcja (VTD-018).
 
-    metadata = _build_metadata(title, mode, client, process, module, environment, author, document_status, output_mode, video_path)
-
-    transcriber = Transcriber(
-        model_size=config.whisper_model,
-        device=config.whisper_device,
-        compute_type=config.whisper_compute_type
-    )
-
-    transcripts: List[SpeechSegment] = []
-    pauses = []
-
+    Zachowanie 1:1 wobec dawnego inline-kodu run_pipeline. Zwraca krotkę.
+    """
     if (track == "meeting" or mode == "meeting") and stream_count >= 3:
+        _emit_progress("audio", step=1, total=6, note="Tryb spotkania — ekstrakcja dwukanałowa")
         print("Krok 1/6: Tryb spotkania — ekstrakcja dwukanałowa (Track 2: Wdrożeniowiec, Track 3: Desktop/system audio — niezweryfikowany rozmówca)...")
         wav_mic = output_dir / "mic_isolated.wav"
         wav_client = output_dir / "client_isolated.wav"
         extract_mic_audio(config.video_path, wav_mic, track_index=1)
         extract_mic_audio(config.video_path, wav_client, track_index=2)
 
+        _emit_progress("silence", step=2, total=6)
         print("Krok 2/6: Wykrywanie pauz w mowie wdrożeniowca...")
         pauses = detect_silence(wav_mic, min_duration=config.min_pause_seconds)
 
+        _emit_progress("transcription", step=3, total=6)
         print("Krok 3/6: Transkrypcja mowy (NVIDIA faster-whisper)...")
         print("  -> Transkrypcja wypowiedzi wdrożeniowca (Track 2)...")
         segs_mic = transcriber.transcribe(wav_mic, language=config.whisper_language)
@@ -266,6 +228,9 @@ def run_pipeline(
         transcripts = sorted(segs_mic + segs_client, key=lambda x: x.start)
         print(f"  -> Łącznie uzyskano {len(transcripts)} segmentów dialogu.")
         wav_path = wav_mic
+        chosen_track = None
+        speaker_label = ""
+        desc = "Track 2+3 (spotkanie)"
     else:
         if track == "auto":
             # auto-detekcja: wybierz best_track_index gdy dostępny
@@ -314,27 +279,52 @@ def run_pipeline(
             speaker_label = "Lektor"
             desc = "Track 2 (Mikrofon lektora)"
 
+        _emit_progress("audio", step=1, total=6, note=desc)
         print(f"Krok 1/6: Ekstrakcja toru audio ({desc})...")
         extract_mic_audio(config.video_path, wav_path, track_index=chosen_track)
 
+        _emit_progress("silence", step=2, total=6)
         print("Krok 2/6: Wykrywanie przerw i pauz w mowie (silencedetect)...")
         pauses = detect_silence(wav_path, min_duration=config.min_pause_seconds)
         print(f"  -> Wykryto {len(pauses)} istotnych pauz w wypowiedzi.")
 
+        _emit_progress("transcription", step=3, total=6)
         print("Krok 3/6: Transkrypcja mowy po polsku (faster-whisper)...")
         transcripts = transcriber.transcribe(wav_path, language=config.whisper_language)
         for s in transcripts:
             s.speaker = speaker_label
         print(f"  -> Uzyskano {len(transcripts)} segmentów wypowiedzi.")
 
+    return transcripts, pauses, wav_path
+
+
+def _stage_extract_unique_frames(config, frames_dir: Path):
+    """Krok 4/6–5/6: ekstrakcja klatek + dedup pHash (VTD-018)."""
+    _emit_progress("scenes", step=4, total=6)
     print("Krok 4/6: Ekstrakcja klatek zmian scen (FFmpeg scene detection)...")
     raw_frames = extract_scene_frames(config.video_path, frames_dir, threshold=config.scene_threshold)
     print(f"  -> Wycięto {len(raw_frames)} kandydujących klatek zmian ekranu.")
 
+    _emit_progress("dedup", step=5, total=6)
     print("Krok 5/6: Deduplikacja percepcyjna klatek (pHash)...")
     unique_frames = filter_duplicate_frames(raw_frames, hamming_threshold=config.phash_threshold)
     print(f"  -> Pozostawiono {len(unique_frames)} unikalnych klatek do instrukcji.")
+    return raw_frames, unique_frames
 
+
+def _stage_fuse_steps(
+    config,
+    video_path: Path,
+    frames_dir: Path,
+    transcripts,
+    pauses,
+    unique_frames,
+    max_step_seconds: float,
+    grid_interval: float,
+    min_step_seconds: float,
+):
+    """Krok 6/6: fuzja sygnałów + walidacja timestampów (VTD-018)."""
+    _emit_progress("fusion", step=6, total=6)
     print("Krok 6/6: Fuzja sygnałów i generowanie dokumentacji...")
     # Wyznacz duration dla siatki
     try:
@@ -376,85 +366,101 @@ def run_pipeline(
     grid_count = sum(len(s.grid_frames) for s in steps)
     # Narrative splits heuristic: steps vs dedup frames
     narrative_splits_count = max(0, len(steps) - len(unique_frames)) if unique_frames else 0
+    return steps, ts_warnings, grid_count, narrative_splits_count
 
-    # ===== Frame QA (C2) =====
+
+def _stage_frame_qa(frame_qa: bool, steps, video_path: Path, frames_dir: Path):
+    """Etap Frame QA: kontrola czytelności klatek przez LLM (VTD-018)."""
     frame_qa_results: List[Dict[str, Any]] = []
     frame_qa_reviews = 0
     frame_qa_swaps = 0
     frame_qa_unknown = 0
-    if frame_qa:
-        print("Kontrola czytelności klatek (LLM) — Frame QA...")
-        try:
-            from vtd.core.frame_qa import FrameReviewer, MAX_REVIEWS, improve_step_frame
-            reviewer = FrameReviewer()
-            # BATCH LIMIT: max 12 wywołań review na nagranie — przy większej liczbie kroków review tylko najdłuższe i te bez mowy
-            MAX_R = MAX_REVIEWS
-            # Determine which steps to review if > MAX_R
-            if len(steps) > MAX_R:
-                # Sort by priority: bez mowy first, then najdłuższe
-                def qa_priority(s):
-                    no_speech = 0 if not s.speech_text.strip() else 1
-                    duration = s.end_time - s.start_time
-                    return (no_speech, -duration)
-                sorted_for_qa = sorted(steps, key=qa_priority)
-                steps_to_review = sorted(sorted_for_qa[:MAX_R], key=lambda s: s.step_number)
-                print(f"  -> Limit {MAX_R} review: wybrano {len(steps_to_review)} kroków (najdłuższe/bez mowy)")
-            else:
-                steps_to_review = steps
+    if not frame_qa:
+        return frame_qa_results, frame_qa_reviews, frame_qa_swaps, frame_qa_unknown
 
-            # Map for quick lookup
-            review_needed_set = set(s.step_number for s in steps_to_review)
-            for s in steps:
-                if s.step_number not in review_needed_set:
-                    # not reviewed due to limit
-                    frame_qa_results.append({"step_number": s.step_number, "verdict": "skipped", "reason": "Limit MAX_REVIEWS", "action": "pozostawiono"})
-                    continue
-                if frame_qa_reviews >= MAX_R:
-                    # GF-022: twardy limit — wcześniej pętla mogła po cichu przekroczyć MAX_REVIEWS
-                    frame_qa_results.append({"step_number": s.step_number, "verdict": "skipped", "reason": f"Twardy limit MAX_REVIEWS ({MAX_R}) osiągnięty", "action": "pozostawiono"})
-                    continue
-                # For reviewed steps, call reviewer
-                # Use step description: take first 500 chars of speech_text or enriched title later
-                step_title = f"Krok {s.step_number}"
-                step_desc = s.speech_text or "Brak opisu"
-                result = reviewer.review_step_frame(s.step_number, step_title, step_desc, s.frame_path)
-                frame_qa_reviews += 1
-                verdict = result.get("verdict", "unknown")
-                reason = result.get("reason", "")
-                if verdict == "unknown":
-                    frame_qa_unknown += 1
-                action = "pozostawiono"
-                if verdict in ("unclear", "wrong"):
-                    # attempt improve
-                    new_frame = improve_step_frame(video_path, s, frames_dir, reviewer)
-                    if new_frame is not None and new_frame.exists():
-                        # Re-review new frame to verify improvement
-                        re_review = reviewer.review_step_frame(s.step_number, step_title, step_desc, new_frame)
-                        frame_qa_reviews += 1  # second review counts? but we keep within limit? spec says max 12 reviews, but improve uses extra calls
-                        # Note: spec MAX_REVIEWS counts review calls; we already exceeded if >12 but allow improve retries
-                        re_verdict = re_review.get("verdict", "unknown")
-                        if re_verdict == "ok":
-                            # Podmień frame_path
-                            old_path = s.frame_path
-                            s.frame_path = new_frame
-                            action = f"podmieniono klatkę na {new_frame.name} (stara: {old_path.name})"
-                            frame_qa_swaps += 1
-                            # Update verdict to ok for final
-                            verdict = re_verdict
-                            reason = re_review.get("reason", reason)
-                        else:
-                            # Not better, keep old but note attempt
-                            action = f"próba re-cut {new_frame.name} — nadal {re_verdict}; pozostawiono oryginał + WYMAGA PODGLĄDU"
-                            # keep original, but verdict remains original unclear/wrong
+    _emit_progress("frame_qa")
+    print("Kontrola czytelności klatek (LLM) — Frame QA...")
+    try:
+        from vtd.core.frame_qa import FrameReviewer, MAX_REVIEWS, improve_step_frame
+        reviewer = FrameReviewer()
+        # BATCH LIMIT: max 12 wywołań review na nagranie — przy większej liczbie kroków review tylko najdłuższe i te bez mowy
+        MAX_R = MAX_REVIEWS
+        # Determine which steps to review if > MAX_R
+        if len(steps) > MAX_R:
+            # Sort by priority: bez mowy first, then najdłuższe
+            def qa_priority(s):
+                no_speech = 0 if not s.speech_text.strip() else 1
+                duration = s.end_time - s.start_time
+                return (no_speech, -duration)
+            sorted_for_qa = sorted(steps, key=qa_priority)
+            steps_to_review = sorted(sorted_for_qa[:MAX_R], key=lambda s: s.step_number)
+            print(f"  -> Limit {MAX_R} review: wybrano {len(steps_to_review)} kroków (najdłuższe/bez mowy)")
+        else:
+            steps_to_review = steps
+
+        # Map for quick lookup
+        review_needed_set = set(s.step_number for s in steps_to_review)
+        for s in steps:
+            if s.step_number not in review_needed_set:
+                # not reviewed due to limit
+                frame_qa_results.append({"step_number": s.step_number, "verdict": "skipped", "reason": "Limit MAX_REVIEWS", "action": "pozostawiono"})
+                continue
+            if frame_qa_reviews >= MAX_R:
+                # GF-022: twardy limit — wcześniej pętla mogła po cichu przekroczyć MAX_REVIEWS
+                frame_qa_results.append({"step_number": s.step_number, "verdict": "skipped", "reason": f"Twardy limit MAX_REVIEWS ({MAX_R}) osiągnięty", "action": "pozostawiono"})
+                continue
+            # For reviewed steps, call reviewer
+            # Use step description: take first 500 chars of speech_text or enriched title later
+            step_title = f"Krok {s.step_number}"
+            step_desc = s.speech_text or "Brak opisu"
+            result = reviewer.review_step_frame(s.step_number, step_title, step_desc, s.frame_path)
+            frame_qa_reviews += 1
+            verdict = result.get("verdict", "unknown")
+            reason = result.get("reason", "")
+            if verdict == "unknown":
+                frame_qa_unknown += 1
+            action = "pozostawiono"
+            if verdict in ("unclear", "wrong"):
+                # attempt improve
+                new_frame = improve_step_frame(video_path, s, frames_dir, reviewer)
+                if new_frame is not None and new_frame.exists():
+                    # Re-review new frame to verify improvement
+                    re_review = reviewer.review_step_frame(s.step_number, step_title, step_desc, new_frame)
+                    frame_qa_reviews += 1  # second review counts? but we keep within limit? spec says max 12 reviews, but improve uses extra calls
+                    # Note: spec MAX_REVIEWS counts review calls; we already exceeded if >12 but allow improve retries
+                    re_verdict = re_review.get("verdict", "unknown")
+                    if re_verdict == "ok":
+                        # Podmień frame_path
+                        old_path = s.frame_path
+                        s.frame_path = new_frame
+                        action = f"podmieniono klatkę na {new_frame.name} (stara: {old_path.name})"
+                        frame_qa_swaps += 1
+                        # Update verdict to ok for final
+                        verdict = re_verdict
+                        reason = re_review.get("reason", reason)
                     else:
-                        action = "próba re-cut nieudana — pozostawiono + WYMAGA PODGLĄDU"
-                frame_qa_results.append({"step_number": s.step_number, "verdict": verdict, "reason": reason, "action": action})
-            print(f"  -> Frame QA: {frame_qa_reviews} review, {frame_qa_swaps} podmian, {frame_qa_unknown} unknown")
-        except Exception as e:
-            print(f"  [FRAME_QA] Błąd: {e}")
-            frame_qa_results.append({"step_number": 0, "verdict": "unknown", "reason": str(e), "action": "błąd QA"})
+                        # Not better, keep old but note attempt
+                        action = f"próba re-cut {new_frame.name} — nadal {re_verdict}; pozostawiono oryginał + WYMAGA PODGLĄDU"
+                        # keep original, but verdict remains original unclear/wrong
+                else:
+                    action = "próba re-cut nieudana — pozostawiono + WYMAGA PODGLĄDU"
+            frame_qa_results.append({"step_number": s.step_number, "verdict": verdict, "reason": reason, "action": action})
+        print(f"  -> Frame QA: {frame_qa_reviews} review, {frame_qa_swaps} podmian, {frame_qa_unknown} unknown")
+    except Exception as e:
+        print(f"  [FRAME_QA] Błąd: {e}")
+        frame_qa_results.append({"step_number": 0, "verdict": "unknown", "reason": str(e), "action": "błąd QA"})
+    return frame_qa_results, frame_qa_reviews, frame_qa_swaps, frame_qa_unknown
 
-    # ===== Adnotacje (PO Frame QA) =====
+
+def _stage_annotations(
+    annotate: bool,
+    mode: str,
+    steps,
+    frame_qa: bool,
+    frame_qa_results: List[Dict[str, Any]],
+    output_dir: Path,
+):
+    """Etap adnotacji AI po Frame QA (VTD-018). Zwraca krotkę wyników."""
     annotations_map: Dict[int, List[Dict[str, Any]]] = {}
     annotated_frames_count = 0
     annotations_per_step: Dict[str, int] = {}
@@ -463,6 +469,7 @@ def run_pipeline(
         print("Adnotacje pominięte — tryb meeting (dokumentacja bez adnotacji).")
         annotate = False  # wyłacz dla dalszych sekcji
     if annotate and mode == "manual":
+        _emit_progress("annotations")
         print("Generowanie adnotacji AI na zrzutach (instrukcja)...")
         try:
             from vtd.core.element_locator import locate_words, plan_annotations
@@ -587,66 +594,266 @@ def run_pipeline(
             # ensure defaults
             for s in steps:
                 annotations_per_step[str(s.step_number)] = 0
+    return annotations_map, annotations_per_step, annotated_frames_count, annotate, annotated_dir
 
-    # ===== Etap 4: NANO BANANA (Gemini Flash Image) — enhancement/oznaczenia klatek =====
-    nano_stats = {"enabled": False, "processed": 0, "accepted": 0, "rejected": 0, "cost_usd": 0.0, "details": []}
+
+def _stage_nano(
+    nano_banana: bool,
+    nano_mode: str,
+    nano_auto_accept: bool,
+    mode: str,
+    steps,
+    frame_qa: bool,
+    frame_qa_results: List[Dict[str, Any]],
+    enriched_data,
+    output_dir: Path,
+):
+    """Etap NANO BANANA (Gemini Flash Image) — enhancement klatek (VTD-018)."""
+    nano_stats: Dict[str, Any] = {"enabled": False, "processed": 0, "accepted": 0, "rejected": 0, "cost_usd": 0.0, "details": []}
+    if not (nano_banana and mode == "manual"):
+        return nano_stats
+    try:
+        from vtd.core.image_enhancer import (
+            enhance_frame_composite, enhance_frame_located, resolve_gemini_key, EnhanceError,
+        )
+        api_key = resolve_gemini_key()
+        if not api_key:
+            print("  [NANO] Brak GEMINI_API_KEY — pomijam enhancement (ustaw klucz w ~/.hermes/.env).")
+        else:
+            nano_stats["enabled"] = True
+            enhanced_dir = output_dir / "frames_enhanced"
+            enhanced_dir.mkdir(parents=True, exist_ok=True)
+            qa_map = {r["step_number"]: r.get("verdict", "ok") for r in frame_qa_results} if frame_qa else {}
+            mode_label = "LOCATED (locator+draw)" if nano_mode == "located" else "COMPOSITE (nano-banana-2)"
+            print(f"Nano Banana ({mode_label}) + weryfikator gemini-flash...")
+            for s in steps:
+                if s.step_number in qa_map and qa_map[s.step_number] in ("wrong", "skipped"):
+                    nano_stats["details"].append({"step": s.step_number, "status": "pominięty (frame_qa)"})
+                    continue
+                # cel kroku: opis z enrichmentu > narracja; hinty OCR NIE idą do prompta (mylą)
+                es_desc = ""
+                if enriched_data and "steps" in enriched_data:
+                    for _es in enriched_data["steps"]:
+                        if _es.get("step_number") == s.step_number:
+                            es_desc = (_es.get("description") or "").strip()
+                            break
+                target_description = es_desc or (s.speech_text or "").strip()
+                step_text = s.speech_text or ""
+                try:
+                    _enhancer = enhance_frame_located if nano_mode == "located" else enhance_frame_composite
+                    res = _enhancer(
+                        s.frame_path, api_key,
+                        target_description=target_description,
+                        step_text=step_text,
+                        output_dir=output_dir / "frames_enhanced",
+                        verify_goal=True,
+                        step_number=s.step_number,
+                    )
+                except EnhanceError as e:
+                    print(f"  [NANO] Krok {s.step_number}: błąd modelu: {e}")
+                    nano_stats["details"].append({"step": s.step_number, "status": "błąd modelu", "error": str(e)[:120]})
+                    continue
+                nano_stats["processed"] += 1
+                nano_stats["cost_usd"] += res.get("cost_usd", 0.0)
+                if res["status"] != "accepted":
+                    print(f"  [NANO] Krok {s.step_number}: REJECTED — {res['reason']}")
+                    nano_stats["rejected"] += 1
+                    nano_stats["details"].append({"step": s.step_number, "status": "rejected", "reason": str(res["reason"])[:160], "cost_usd": res.get("cost_usd", 0.0)})
+                    continue
+                if nano_auto_accept:
+                    (output_dir / "frames_enhanced" / (Path(s.frame_path.name).stem + "_accepted")).write_text("auto", encoding="utf-8")
+                nano_stats["accepted"] += 1
+                nano_stats["details"].append({"step": s.step_number, "status": "accepted", "file": s.frame_path.name, "cost_usd": res.get("cost_usd", 0.0), "target_ok": res.get("target_ok")})
+            print(f"  -> Nano Banana composite: {nano_stats['accepted']} przyjętych, {nano_stats['rejected']} odrzuconych (jednolitość+cel), koszt ~${nano_stats['cost_usd']:.3f}")
+    except Exception as e:
+        print(f"  [NANO] Błąd globalny enhancement: {e}")
+    return nano_stats
+
+
+def _stage_enrich(
+    enrich: bool,
+    enrich_model: str,
+    mode: str,
+    title: str,
+    steps,
+    frame_qa: bool,
+    frame_qa_results: List[Dict[str, Any]],
+    client, process, module, environment, author, document_status,
+    output_dir: Path,
+    metadata: Dict[str, Any],
+):
+    """Etap wzbogacania LLM + audytu QA (VTD-018). Zwraca (enriched_data, qa_issues)."""
+    qa_issues: List[str] = []
     enriched_data = None
-    if nano_banana and mode == "manual":
-        try:
-            from vtd.core.image_enhancer import (
-                enhance_frame_composite, enhance_frame_located, resolve_gemini_key, EnhanceError,
+    if not enrich:
+        return enriched_data, qa_issues
+    try:
+        print(f"Wzbogacanie treści draftu przez model LLM ({enrich_model}) — tryb {mode}...")
+        from vtd.core.enricher import enrich_steps_with_llm
+        # Pass frame QA context: GF-007 — QA idzie osobnym kanałem do promptu
+        # enrichera (frame_qa_results), NIE przez mutację step.speech_text.
+        enriched_data = enrich_steps_with_llm(
+            title=title, steps=steps, model=enrich_model,
+            client=client, process=process, module=module, environment=environment,
+            author=author, document_status=document_status, mode=mode,
+            frame_qa_results=frame_qa_results if frame_qa else None,
+        )
+        if enriched_data:
+            print("  -> Pomyślnie zredagowano draft przez LLM (status DRAFT / DO WERYFIKACJI).")
+            print("Bramka QA: Ograniczona kontrola spójności DRAFT (bez połączenia z bazą ERP)...")
+            from vtd.core.qa_verifier import audit_and_fix_manual
+            # DS-003: twardo zaszyty identyfikator modelu QA usunięty — nadpisywał
+            # cfg.llm.qa_verifier_model. Bez kwargsa qa_verifier wybiera model
+            # z konfiguracji (fallback wewnętrzny qa_verifier.py).
+            enriched_data, qa_issues = audit_and_fix_manual(
+                enriched_data=enriched_data,
+                steps=steps,
+                title=title,
             )
-            api_key = resolve_gemini_key()
-            if not api_key:
-                print("  [NANO] Brak GEMINI_API_KEY — pomijam enhancement (ustaw klucz w ~/.hermes/.env).")
+            if qa_issues:
+                print("  [QA AUDYT — DRAFT / DO WERYFIKACJI] Uwagi do ręcznej weryfikacji:")
+                for issue in qa_issues:
+                    print(f"    • {issue}")
             else:
-                nano_stats["enabled"] = True
-                enhanced_dir = output_dir / "frames_enhanced"
-                enhanced_dir.mkdir(parents=True, exist_ok=True)
-                qa_map = {r["step_number"]: r.get("verdict", "ok") for r in frame_qa_results} if frame_qa else {}
-                mode_label = "LOCATED (locator+draw)" if nano_mode == "located" else "COMPOSITE (nano-banana-2)"
-                print(f"Nano Banana ({mode_label}) + weryfikator gemini-flash...")
-                for s in steps:
-                    if s.step_number in qa_map and qa_map[s.step_number] in ("wrong", "skipped"):
-                        nano_stats["details"].append({"step": s.step_number, "status": "pominięty (frame_qa)"})
-                        continue
-                    # cel kroku: opis z enrichmentu > narracja; hinty OCR NIE idą do prompta (mylą)
-                    es_desc = ""
-                    if enriched_data and "steps" in enriched_data:
-                        for _es in enriched_data["steps"]:
-                            if _es.get("step_number") == s.step_number:
-                                es_desc = (_es.get("description") or "").strip()
-                                break
-                    target_description = es_desc or (s.speech_text or "").strip()
-                    step_text = s.speech_text or ""
-                    try:
-                        _enhancer = enhance_frame_located if nano_mode == "located" else enhance_frame_composite
-                        res = _enhancer(
-                            s.frame_path, api_key,
-                            target_description=target_description,
-                            step_text=step_text,
-                            output_dir=output_dir / "frames_enhanced",
-                            verify_goal=True,
-                            step_number=s.step_number,
-                        )
-                    except EnhanceError as e:
-                        print(f"  [NANO] Krok {s.step_number}: błąd modelu: {e}")
-                        nano_stats["details"].append({"step": s.step_number, "status": "błąd modelu", "error": str(e)[:120]})
-                        continue
-                    nano_stats["processed"] += 1
-                    nano_stats["cost_usd"] += res.get("cost_usd", 0.0)
-                    if res["status"] != "accepted":
-                        print(f"  [NANO] Krok {s.step_number}: REJECTED — {res['reason']}")
-                        nano_stats["rejected"] += 1
-                        nano_stats["details"].append({"step": s.step_number, "status": "rejected", "reason": str(res["reason"])[:160], "cost_usd": res.get("cost_usd", 0.0)})
-                        continue
-                    if nano_auto_accept:
-                        (output_dir / "frames_enhanced" / (Path(s.frame_path.name).stem + "_accepted")).write_text("auto", encoding="utf-8")
-                    nano_stats["accepted"] += 1
-                    nano_stats["details"].append({"step": s.step_number, "status": "accepted", "file": s.frame_path.name, "cost_usd": res.get("cost_usd", 0.0), "target_ok": res.get("target_ok")})
-                print(f"  -> Nano Banana composite: {nano_stats['accepted']} przyjętych, {nano_stats['rejected']} odrzuconych (jednolitość+cel), koszt ~${nano_stats['cost_usd']:.3f}")
-        except Exception as e:
-            print(f"  [NANO] Błąd globalny enhancement: {e}")
+                print("  [QA AUDYT] DRAFT / DO WERYFIKACJI — brak automatycznych uwag, wymagana ręczna weryfikacja.")
+
+            qa_report_path = output_dir / "QA_AUDIT.md"
+            qa_md = [
+                f"# Raport Kontroli Spójności DRAFT: {title}",
+                "",
+                f"**Status dokumentu:** DRAFT / DO WERYFIKACJI — wymaga ręcznej weryfikacji przez wdrożeniowca. Nie jest to weryfikacja merytoryczna z bazą ERP.",
+                f"**Model audytujący (ograniczony zakres):** {enrich_model}",
+                f"**Data:** {datetime.now(timezone.utc).isoformat()}",
+                "",
+                "## Uwagi do weryfikacji (nie są to potwierdzenia z bazy ERP):",
+                ""
+            ]
+            if qa_issues:
+                for iss in qa_issues:
+                    qa_md.append(f"- {iss}")
+            else:
+                qa_md.append("- Brak automatycznych uwag. Dokument nadal wymaga ręcznej weryfikacji — nie twierdzimy o zgodności z bazą ERP.")
+            qa_md.append("")
+            qa_md.append("> **Uwaga:** Ten raport to jedynie lokalna kontrola spójności draftu. Nie wykonano połączenia z bazą ERP. Status zawsze DRAFT / DO WERYFIKACJI.")
+            qa_report_path.write_text("\n".join(qa_md), encoding="utf-8")
+            metadata["enrich_status"] = "success"
+            metadata["qa_issues"] = qa_issues
+        else:
+            print("  -> Ostrzeżenie: wzbogacanie LLM zwróciło None — draft bez enrich, status DRAFT / DO WERYFIKACJI.")
+            metadata["enrich_status"] = "failed"
+            metadata["qa_issues"] = ["Enricher zwrócił None — brak wzbogacenia, draft wymaga ręcznej weryfikacji."]
+            # Zapisz ostrzeżenie
+            (output_dir / "ENRICHER_WARNING.md").write_text(
+                f"# Ostrzeżenie Enricher: {title}\n\n**Status:** DRAFT / DO WERYFIKACJI\n\nEnricher nie zwrócił danych (None / błąd). Dokument nie jest gotowy jako jakościowy — wymaga ręcznej weryfikacji i uzupełnienia. Nie wysyłaj do klienta.\n",
+                encoding="utf-8"
+            )
+    except Exception as e:
+        print(f"  -> Ostrzeżenie: wzbogacanie LLM pominięte ({e}). Status DRAFT / DO WERYFIKACJI.")
+        metadata["enrich_status"] = f"error: {e}"
+        metadata["qa_issues"] = [f"Błąd enrichera: {e} — draft wymaga ręcznej weryfikacji."]
+        (output_dir / "ENRICHER_WARNING.md").write_text(
+            f"# Błąd Enrichera: {title}\n\n**Status:** DRAFT / DO WERYFIKACJI\n\nBłąd: {e}\n\nDokument nie jest gotowy jako jakościowy — wymaga ręcznej weryfikacji. Nie wysyłaj do klienta.\n",
+            encoding="utf-8"
+        )
+    return enriched_data, qa_issues
+
+
+def run_pipeline(
+    video_path: Path,
+    output_dir: Path,
+    title: str,
+    device: str = "auto",
+    model_size: str = "large-v3",
+    scene_threshold: Optional[float] = None,
+    track: str = "mic",
+    mode: str = "manual",
+    enrich: bool = False,
+    enrich_model: str = DEFAULT_ENRICH_MODEL,
+    client: Optional[str] = None,
+    process: Optional[str] = None,
+    module: Optional[str] = None,
+    environment: Optional[str] = None,
+    author: Optional[str] = None,
+    document_status: str = "DRAFT",
+    output_mode: str = "both",
+    max_step_seconds: float = 45.0,
+    grid_interval: float = 30.0,
+    frame_qa: bool = False,
+    min_step_seconds: float = 6.0,
+    annotate: bool = False,
+    nano_banana: bool = False,
+    nano_mode: str = "located",
+    nano_auto_accept: bool = False,
+):
+    if not video_path.exists():
+        # GF-025: raise PipelineError zamiast sys.exit(1) — exit tylko w warstwie CLI
+        raise PipelineError(f"Plik wideo {video_path} nie istnieje!")
+
+    chosen_device, chosen_compute = resolve_device_and_compute(device)
+
+    # VTD-023: PipelineConfig budowany dokładnie raz (wcześniej dwa identyczne
+    # konstruktory dla gałęzi z/bez scene_threshold).
+    config_kwargs = dict(
+        video_path=video_path,
+        output_dir=output_dir,
+        document_title=title,
+        whisper_device=chosen_device,
+        whisper_compute_type=chosen_compute,
+        whisper_model=model_size,
+    )
+    if scene_threshold is not None:
+        config_kwargs["scene_threshold"] = scene_threshold
+    config = PipelineConfig(**config_kwargs)
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+    frames_dir = output_dir / "frames"
+    wav_path = output_dir / "mic_isolated.wav"
+    try:
+        stream_count = get_audio_stream_count(config.video_path)
+    except Exception:
+        stream_count = 1
+
+    # Auto-detekcja toru audio (track == "auto")
+    auto_detection = _stage_auto_detect(config, track, stream_count)
+
+    print(f"=== Rozpoczęcie przetwarzania nagrania: {video_path.name} ===")
+    print(f"Konfiguracja: urządzenie={config.whisper_device} ({config.whisper_compute_type}), model={config.whisper_model}, tryb={mode}, ścieżki_audio={stream_count}")
+    print(f"Metadane: klient={client or 'DO UZUPEŁNIENIA'} | proces={process or 'DO UZUPEŁNIENIA'} | moduł={module or 'DO UZUPEŁNIENIA'} | env={environment or 'DO UZUPEŁNIENIA'} | status={document_status} | output={output_mode}")
+
+    metadata = _build_metadata(title, mode, client, process, module, environment, author, document_status, output_mode, video_path)
+
+    transcriber = Transcriber(
+        model_size=config.whisper_model,
+        device=config.whisper_device,
+        compute_type=config.whisper_compute_type
+    )
+
+    transcripts, pauses, wav_path = _stage_audio_and_transcribe(
+        config, output_dir, wav_path, transcriber, track, mode, stream_count, auto_detection,
+    )
+
+    raw_frames, unique_frames = _stage_extract_unique_frames(config, frames_dir)
+
+    steps, ts_warnings, grid_count, narrative_splits_count = _stage_fuse_steps(
+        config, video_path, frames_dir, transcripts, pauses, unique_frames,
+        max_step_seconds, grid_interval, min_step_seconds,
+    )
+
+    # ===== Frame QA (C2) =====
+    frame_qa_results, frame_qa_reviews, frame_qa_swaps, frame_qa_unknown = _stage_frame_qa(
+        frame_qa, steps, video_path, frames_dir,
+    )
+
+    # ===== Adnotacje (PO Frame QA) =====
+    annotations_map, annotations_per_step, annotated_frames_count, annotate, annotated_dir = _stage_annotations(
+        annotate, mode, steps, frame_qa, frame_qa_results, output_dir,
+    )
+    # ===== Etap 4: NANO BANANA (Gemini Flash Image) — enhancement/oznaczenia klatek =====
+    nano_stats = _stage_nano(
+        nano_banana, nano_mode, nano_auto_accept, mode, steps,
+        frame_qa, frame_qa_results, None, output_dir,
+    )
+    enriched_data = None
 
     # Statystyki kompletności
     raw_count = len(raw_frames)
@@ -697,76 +904,21 @@ def run_pipeline(
     metadata["nano_banana_stats"] = nano_stats
     metadata["annotations_detail"] = {str(k): [{"type": a.get("type"), "element": a.get("element"), "label": a.get("label"), "box": a.get("box")} for a in v] for k, v in annotations_map.items()}
 
-    qa_issues: List[str] = []
-    if enrich:
-        try:
-            print(f"Wzbogacanie treści draftu przez model LLM ({enrich_model}) — tryb {mode}...")
-            from vtd.core.enricher import enrich_steps_with_llm
-            # Pass frame QA context: GF-007 — QA idzie osobnym kanałem do promptu
-            # enrichera (frame_qa_results), NIE przez mutację step.speech_text.
-            enriched_data = enrich_steps_with_llm(
-                title=title, steps=steps, model=enrich_model,
-                client=client, process=process, module=module, environment=environment,
-                author=author, document_status=document_status, mode=mode,
-                frame_qa_results=frame_qa_results if frame_qa else None,
-            )
-            if enriched_data:
-                print("  -> Pomyślnie zredagowano draft przez LLM (status DRAFT / DO WERYFIKACJI).")
-                print("Bramka QA: Ograniczona kontrola spójności DRAFT (bez połączenia z bazą ERP)...")
-                from vtd.core.qa_verifier import audit_and_fix_manual
-                # DS-003: twardo zaszyty identyfikator modelu QA usunięty — nadpisywał
-                # cfg.llm.qa_verifier_model. Bez kwargsa qa_verifier wybiera model
-                # z konfiguracji (fallback wewnętrzny qa_verifier.py).
-                enriched_data, qa_issues = audit_and_fix_manual(
-                    enriched_data=enriched_data,
-                    steps=steps,
-                    title=title,
-                )
-                if qa_issues:
-                    print("  [QA AUDYT — DRAFT / DO WERYFIKACJI] Uwagi do ręcznej weryfikacji:")
-                    for issue in qa_issues:
-                        print(f"    • {issue}")
-                else:
-                    print("  [QA AUDYT] DRAFT / DO WERYFIKACJI — brak automatycznych uwag, wymagana ręczna weryfikacja.")
+    enriched_data, qa_issues = _stage_enrich(
+        enrich, enrich_model, mode, title, steps, frame_qa, frame_qa_results,
+        client, process, module, environment, author, document_status,
+        output_dir, metadata,
+    )
 
-                qa_report_path = output_dir / "QA_AUDIT.md"
-                qa_md = [
-                    f"# Raport Kontroli Spójności DRAFT: {title}",
-                    "",
-                    f"**Status dokumentu:** DRAFT / DO WERYFIKACJI — wymaga ręcznej weryfikacji przez wdrożeniowca. Nie jest to weryfikacja merytoryczna z bazą ERP.",
-                    f"**Model audytujący (ograniczony zakres):** {enrich_model}",
-                    f"**Data:** {datetime.now(timezone.utc).isoformat()}",
-                    "",
-                    "## Uwagi do weryfikacji (nie są to potwierdzenia z bazy ERP):",
-                    ""
-                ]
-                if qa_issues:
-                    for iss in qa_issues:
-                        qa_md.append(f"- {iss}")
-                else:
-                    qa_md.append("- Brak automatycznych uwag. Dokument nadal wymaga ręcznej weryfikacji — nie twierdzimy o zgodności z bazą ERP.")
-                qa_md.append("")
-                qa_md.append("> **Uwaga:** Ten raport to jedynie lokalna kontrola spójności draftu. Nie wykonano połączenia z bazą ERP. Status zawsze DRAFT / DO WERYFIKACJI.")
-                qa_report_path.write_text("\n".join(qa_md), encoding="utf-8")
-                metadata["enrich_status"] = "success"
-                metadata["qa_issues"] = qa_issues
-            else:
-                print("  -> Ostrzeżenie: wzbogacanie LLM zwróciło None — draft bez enrich, status DRAFT / DO WERYFIKACJI.")
-                metadata["enrich_status"] = "failed"
-                metadata["qa_issues"] = ["Enricher zwrócił None — brak wzbogacenia, draft wymaga ręcznej weryfikacji."]
-                # Zapisz ostrzeżenie
-                (output_dir / "ENRICHER_WARNING.md").write_text(
-                    f"# Ostrzeżenie Enricher: {title}\n\n**Status:** DRAFT / DO WERYFIKACJI\n\nEnricher nie zwrócił danych (None / błąd). Dokument nie jest gotowy jako jakościowy — wymaga ręcznej weryfikacji i uzupełnienia. Nie wysyłaj do klienta.\n",
-                    encoding="utf-8"
-                )
-        except Exception as e:
-            print(f"  -> Ostrzeżenie: wzbogacanie LLM pominięte ({e}). Status DRAFT / DO WERYFIKACJI.")
-            metadata["enrich_status"] = f"error: {e}"
-            metadata["qa_issues"] = [f"Błąd enrichera: {e} — draft wymaga ręcznej weryfikacji."]
-            (output_dir / "ENRICHER_WARNING.md").write_text(
-                f"# Błąd Enrichera: {title}\n\n**Status:** DRAFT / DO WERYFIKACJI\n\nBłąd: {e}\n\nDokument nie jest gotowy jako jakościowy — wymaga ręcznej weryfikacji. Nie wysyłaj do klienta.\n",
-                encoding="utf-8"
-            )
+    # VTD-023: mapy verdictu QA zdefiniowane jawnie (wcześniej `in locals()`
+    # w sekcji COMPLETENESS — ukryta zależność od gałęzi --annotate)
+    qa_verdict_map: Dict[int, str] = {
+        r["step_number"]: r.get("verdict", "ok") for r in frame_qa_results
+    } if frame_qa else {}
+    skipped_qa_steps: List[int] = [
+        r["step_number"] for r in frame_qa_results
+        if r.get("verdict") not in ("ok", "skipped")
+    ]
 
     # Zapisz metadata.json — lokalny plik prawdy o metadanych (nie nazwa pliku)
     metadata_path = output_dir / "metadata.json"
@@ -859,13 +1011,13 @@ def run_pipeline(
             anns = annotations_map.get(s.step_number, [])
             cnt = len(anns)
             elems = ", ".join(a.get("element", a.get("label", "")) for a in anns) if anns else "—"
-            if frame_qa and s.step_number in (qa_verdict_map if 'qa_verdict_map' in locals() else {}):
+            if frame_qa and s.step_number in qa_verdict_map:
                 v = qa_verdict_map.get(s.step_number, "ok")
                 if v not in ("ok", "skipped"):
                     elems = f"pominięto (frame_qa={v})"
                     cnt = 0
             comp_lines.append(f"| {s.step_number} | {cnt} | {elems} |")
-        if 'skipped_qa_steps' in locals() and skipped_qa_steps:
+        if skipped_qa_steps:
             comp_lines.append("")
             comp_lines.append(f"- Kroki pominięte (frame_qa != ok): {', '.join(str(x) for x in skipped_qa_steps)}")
     else:
@@ -876,7 +1028,7 @@ def run_pipeline(
 
     # Sekcja Nano Banana (Etap 4)
     comp_lines.extend(["", "## Nano Banana (AI enhancement)"])
-    _ns = nano_stats if 'nano_stats' in locals() else {"enabled": False}
+    _ns = nano_stats
     if _ns.get("enabled"):
         comp_lines.append(f"- Model: gemini-3.1-flash-image (Google AI Studio)")
         comp_lines.append(f"- Przetworzone klatki: {_ns.get('processed', 0)} | przyjęte: {_ns.get('accepted', 0)} | odrzucone (walidacja wierności): {_ns.get('rejected', 0)}")
@@ -975,7 +1127,7 @@ def run_pipeline(
                 enriched_data.setdefault("steps", []).append({"step_number": sn, "qa_preview": reason})
 
     # Wstrzyknij adnotacje do enriched_data dla renderers (legenda badge)
-    if 'annotations_map' in locals() and annotations_map:
+    if annotations_map:
         if enriched_data is None:
             enriched_data = {"steps": []}
         if "steps" not in enriched_data:

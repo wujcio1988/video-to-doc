@@ -12,6 +12,9 @@ from typing import Any, Dict, List, Optional
 from vtd.config import load_config
 
 _lock = threading.Lock()
+# VTD-014: jednorazowa inicjalizacja schematu per ścieżka bazy — init_db() było
+# wywoływane przy każdym CRUD, co kosztuje dodatkowy dysk I/O przy każdym zapytaniu.
+_initialized_paths: set = set()
 
 CREATE_TABLE_SQL = """
 CREATE TABLE IF NOT EXISTS tasks (
@@ -56,17 +59,28 @@ def get_db_path() -> Path:
 
 
 def get_connection() -> sqlite3.Connection:
-    conn = sqlite3.connect(str(get_db_path()), check_same_thread=False)
+    conn = sqlite3.connect(str(get_db_path()), check_same_thread=False, timeout=30.0)
+    # VTD-014: WAL + busy_timeout — zapisy współbieżne (kolejka zadań + Studio)
+    # nie kończą się już błędem 'database is locked'; busy_timeout daje czas na
+    # zwolnienie blokady zamiast natychmiastowego exception.
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.execute("PRAGMA busy_timeout=5000")
+    conn.execute("PRAGMA synchronous=NORMAL")
     conn.row_factory = sqlite3.Row
     return conn
 
 
 def init_db() -> None:
     with _lock:
+        db_path = str(get_db_path())
+        # VTD-014: schemat zakładamy raz na ścieżkę — kolejne wywołania to no-op.
+        if db_path in _initialized_paths:
+            return
         conn = get_connection()
         try:
             conn.execute(CREATE_TABLE_SQL)
             conn.commit()
+            _initialized_paths.add(db_path)
         finally:
             conn.close()
 

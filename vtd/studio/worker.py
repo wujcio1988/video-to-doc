@@ -4,6 +4,7 @@ Proces roboczy (worker) obsługujący kolejkę zadań przetwarzania wideo w Stud
 from __future__ import annotations
 
 import re
+import json
 import subprocess
 import sys
 import threading
@@ -110,6 +111,43 @@ def _terminate_process(proc: subprocess.Popen) -> None:
             proc.wait(timeout=TERMINATE_GRACE_SECONDS)
         except Exception:
             pass
+
+
+# VTD-012: mapowanie stage -> opis (fallback, gdy CLI nie wysłał `note` w markerze)
+_STAGE_NOTES = {
+    "audio": "Ekstrakcja toru audio",
+    "silence": "Wykrywanie pauz w mowie",
+    "transcription": "Transkrypcja mowy (Whisper)",
+    "scenes": "Detekcja scen i wycinanie klatek",
+    "dedup": "Deduplikacja percepcyjna pHash",
+    "fusion": "Fuzja sygnałów i generowanie dokumentacji",
+    "frame_qa": "Weryfikacja czytelności klatek",
+    "annotations": "Generowanie adnotacji wizualnych",
+}
+
+
+def _parse_progress_marker(line: str) -> Optional[Dict[str, Any]]:
+    """VTD-012: parsuje linię `##VTD_PROGRESS:{json}` emitowaną przez CLI.
+
+    Zwraca dict z kluczami `stage` (+ opcjonalnie `step`, `total`, `note`),
+    albo None gdy linia nie jest poprawnym markerem (wtedy fallback na
+    heurystykę stringów).
+    """
+    stripped = line.strip()
+    prefix = "##VTD_PROGRESS:"
+    if not stripped.startswith(prefix):
+        return None
+    payload = stripped[len(prefix):].strip()
+    try:
+        data = json.loads(payload)
+    except Exception:
+        return None
+    if not isinstance(data, dict):
+        return None
+    stage = data.get("stage")
+    if not isinstance(stage, str) or not stage:
+        return None
+    return data
 
 
 def _worker_loop() -> None:
@@ -234,7 +272,17 @@ def _execute_task(task_id: int) -> None:
                 if len(error_lines) > 50:
                     error_lines.pop(0)
 
-                # Mapowanie etapów
+                # VTD-012: ustrukturyzowany marker postępu ##VTD_PROGRESS:{json}
+                # ma pierwszeństwo przed heurystyką stringów "Krok N/6".
+                # Fallback klasyk zostaje — jako awaryjny dla starszych CLI.
+                if line.lstrip().startswith("##VTD_PROGRESS:"):
+                    progress = _parse_progress_marker(line)
+                    if progress is not None:
+                        stage = progress["stage"]
+                        note = progress.get("note") or _STAGE_NOTES.get(stage)
+                        update_task(task_id, stage=stage, progress_note=note)
+                        continue
+                # Mapowanie etapów (fallback heurystyczny dla starszych wersji)
                 if "Krok 1/6" in line:
                     update_task(task_id, stage="audio", progress_note="Ekstrakcja toru audio")
                 elif "Krok 2/6" in line:

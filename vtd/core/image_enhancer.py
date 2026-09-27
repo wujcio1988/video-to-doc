@@ -8,11 +8,14 @@ Zasady twarde:
 - Każdy wynik zapisywany jako NOWY plik (frames_enhanced/), oryginał nigdy nie modyfikowany.
 """
 import base64
+import ipaddress
 import json
 import os
+import socket
 import subprocess
 import time
 import urllib.error
+import urllib.parse
 import urllib.request
 from dataclasses import dataclass
 from pathlib import Path
@@ -52,6 +55,50 @@ _KEY_FILES = [
 
 class EnhanceError(Exception):
     pass
+
+
+def _validate_fetch_url(url: str) -> None:
+    """VTD-028: walidacja URL przed pobraniem obrazu z odpowiedzi gatewaya.
+
+    Chroni przed SSRF: dopuszcza wyłącznie http/https po publicznym adresie.
+    Zabronione: loopback, sieci prywatne i link-local (w tym 169.254.169.254 —
+    metadane chmury), adresy nie-rozpoznawalne. Podnosi EnhanceError."""
+    parsed = urllib.parse.urlparse(url)
+    if parsed.scheme not in ("http", "https"):
+        raise EnhanceError(f"VTD-028: odrzucono URL o niedozwolonym schemacie ({parsed.scheme or 'brak'})")
+    host = parsed.hostname
+    if not host:
+        raise EnhanceError("VTD-028: odrzucono URL bez hosta")
+    # IP-literał — waliduj bezpośrednio
+    try:
+        ip = ipaddress.ip_address(host)
+    except ValueError:
+        try:
+            infos = socket.getaddrinfo(host, parsed.port or (443 if parsed.scheme == "https" else 80))
+        except (socket.gaierror, OSError) as e:
+            raise EnhanceError(f"VTD-028: nie można rozwiązać hosta {host}: {e}") from e
+        if not infos:
+            raise EnhanceError(f"VTD-028: brak rekordów DNS dla {host}")
+    else:
+        infos = [(None, None, None, None, (str(ip), 0))]
+    for info in infos:
+        addr = info[4][0] if info and len(info) > 4 and info[4] else None
+        if addr is None:
+            continue
+        try:
+            ip2 = ipaddress.ip_address(addr)
+        except ValueError:
+            continue
+        if (
+            ip2.is_loopback
+            or ip2.is_private
+            or ip2.is_link_local
+            or ip2.is_multicast
+            or ip2.is_reserved
+            or ip2.is_unspecified
+        ):
+            raise EnhanceError(f"VTD-028: odrzucono połączenie do adresu prywatnego/niepublicznego ({addr})")
+    # 169.254.169.254 (metadane chmury) to is_link_local — pokryte powyżej.
 
 
 @dataclass
@@ -171,6 +218,8 @@ def _omniroute_image_call(frame_path, prompt: str, api_key: str, model: str, tim
     if d0.get("b64_json"):
         out_bytes = base64.b64decode(d0["b64_json"])
     elif d0.get("url"):
+        # VTD-028: walidacja SSRF przed pobraniem wyniku z gatewaya
+        _validate_fetch_url(d0["url"])
         with _urlopen_with_retry(d0["url"], timeout=60) as r:
             out_bytes = r.read()
     if not out_bytes:
@@ -238,11 +287,15 @@ def compose(orig_path, layer_path, out_path) -> Tuple[bool, str]:
 
 
 def _gemini_text_call(parts: list, api_key: str, model: str, timeout_s: int = 60) -> Tuple[dict, float, int, int]:
-    """Pomocnicze: wywołanie generateContent, zwraca (response, latency, tokens_in, tokens_out)."""
-    url = f"{API_BASE}/{model}:generateContent?key={api_key}"
+    """Pomocnicze: wywołanie generateContent, zwraca (response, latency, tokens_in, tokens_out).
+    VTD-028: klucz API przeniesiony z query (?key=) do nagłówka x-goog-api-key,
+    żeby klucz nie trafiał do URL-i/logów."""
+    url = f"{API_BASE}/{model}:generateContent"
     payload = {"contents": [{"parts": parts}]}
     req = urllib.request.Request(
-        url, data=json.dumps(payload).encode(), headers={"Content-Type": "application/json"}
+        url,
+        data=json.dumps(payload).encode(),
+        headers={"Content-Type": "application/json", "x-goog-api-key": api_key},
     )
     t0 = time.time()
     try:
