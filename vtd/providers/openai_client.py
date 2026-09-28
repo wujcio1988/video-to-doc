@@ -22,10 +22,16 @@ def robust_json_decode(text: str) -> Dict[str, Any]:
     """
     Tolerancyjne dekodowanie JSON ze zwróconej odpowiedzi modelu LLM.
     Wyciąga bloki ```json ... ``` lub pierwsze dopasowanie nawiasów klamrowych.
+
+    R-B: rozróżnia dwie sytuacje zamiast cichego zwracania ``{}``:
+      * pusta/whitespace odpowiedź  -> ValueError „pusta odpowiedź",
+      * niepusta, ale nieparsowalna -> ValueError z pierwszymi 200 znakami treści.
     """
-    if not text:
-        return {}
-    clean = text.strip()
+    if text is None or not str(text).strip():
+        raise ValueError(
+            "Pusta odpowiedź od LLM — brak treści do sparsowania JSON (content pusty)."
+        )
+    clean = str(text).strip()
 
     # 1. Próba bezpośredniego parsowania
     try:
@@ -60,7 +66,7 @@ def robust_json_decode(text: str) -> Dict[str, Any]:
         except Exception:
             pass
 
-    raise ValueError(f"Nie udało się sparsować odpowiedzi JSON od LLM: {text[:200]}")
+    raise ValueError(f"Nie udało się sparsować odpowiedzi JSON od LLM: {clean[:200]}")
 
 
 class OpenAIProvider(BaseLLMProvider):
@@ -73,7 +79,7 @@ class OpenAIProvider(BaseLLMProvider):
         self,
         base_url: str = "https://api.openai.com/v1",
         api_key: str = "",
-        timeout: float = 60.0,
+        timeout: float = 180.0,
         max_retries: int = 3,
     ) -> None:
         self.base_url = base_url.rstrip("/")
@@ -112,7 +118,28 @@ class OpenAIProvider(BaseLLMProvider):
                         # Błąd walidacji odpowiedzi — permanentny, bez retry.
                         raise ValueError(f"Brak choices w odpowiedzi LLM: {resp_data}")
                     content = choices[0].get("message", {}).get("content", "")
-                    return content or ""
+                    if content is None:
+                        content = ""
+                    if not str(content).strip():
+                        # R-A: model rozumujący (np. deepseek) potrafi wyczerpać
+                        # budżet na reasoning i zwrócić pusty `content`. Próbujemy
+                        # odzyskać pierwszy obiekt JSON z `reasoning_content`,
+                        # a gdy się nie da — zgłaszamy jawny błąd (nigdy ciche "").
+                        message = choices[0].get("message", {}) or {}
+                        reasoning = message.get("reasoning_content") or ""
+                        recovered = self._recover_content_from_reasoning(reasoning)
+                        if recovered:
+                            print(
+                                "[OSTRZEŻENIE] LLM zwrócił pusty 'content' — odzyskano treść "
+                                f"z 'reasoning_content' ({len(recovered)} znaków)."
+                            )
+                            content = recovered
+                        else:
+                            raise ValueError(
+                                "LLM zwrócił pustą treść odpowiedzi (content pusty, brak "
+                                f"parsowalnego reasoning_content). reasoning: {str(reasoning)[:200]!r}"
+                            )
+                    return content
             except urllib.error.HTTPError as e:
                 err_body = ""
                 try:
@@ -134,6 +161,44 @@ class OpenAIProvider(BaseLLMProvider):
                 raise last_error
 
         raise RuntimeError(f"Przekroczono limit prób wywołania LLM: {last_error}")
+
+    @staticmethod
+    def _recover_content_from_reasoning(reasoning: str) -> str:
+        """
+        R-A: próbuje wydobyć pierwszy obiekt JSON z ``reasoning_content`` modelu
+        rozumującego. Zwraca tekst gotowy do ``robust_json_decode`` lub "" gdy brak
+        parsowalnego JSON-a (wtedy caller zgłasza jawny błąd).
+        """
+        text = (reasoning or "").strip()
+        if not text:
+            return ""
+        # 1. Cała treść jest poprawnym JSON-em.
+        try:
+            json.loads(text)
+            return text
+        except ValueError:
+            pass
+        # 2. Pierwszy blok klamrowy { ... }.
+        start = text.find("{")
+        end = text.rfind("}")
+        if start != -1 and end > start:
+            candidate = text[start : end + 1]
+            try:
+                json.loads(candidate)
+                return candidate
+            except ValueError:
+                pass
+        # 3. Pierwsza tablica [ ... ].
+        bracket_start = text.find("[")
+        bracket_end = text.rfind("]")
+        if bracket_start != -1 and bracket_end > bracket_start:
+            candidate = text[bracket_start : bracket_end + 1]
+            try:
+                json.loads(candidate)
+                return candidate
+            except ValueError:
+                pass
+        return ""
 
     def _backoff_seconds(self, attempt: int) -> float:
         """Exponential backoff z ograniczeniem i jitterem (±25%)."""

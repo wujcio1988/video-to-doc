@@ -50,7 +50,7 @@ def build_parser() -> argparse.ArgumentParser:
     run_cmd.add_argument("--track", choices=["mic", "mix", "meeting", "0", "1", "2", "auto"], default="mic", help="Ścieżka audio: mic (Track 2 - mikrofon lektora), mix (Track 1 - miks), meeting (Track 2 + Track 3 - dialog; Track 3 to Desktop/system audio — niezweryfikowany rozmówca), auto (auto-detekcja najlepszego toru)")
     run_cmd.add_argument("--mode", choices=["manual", "meeting"], default="manual", help="Tryb pracy: manual (instrukcja krok po kroku), meeting (protokół spotkania — nie instrukcja)")
     run_cmd.add_argument("--enrich", action="store_true", help="Wzbogać draft przez model LLM (OmniRoute) — wynik nadal DRAFT / DO WERYFIKACJI")
-    run_cmd.add_argument("--enrich-model", default=DEFAULT_ENRICH_MODEL, help="Model LLM w bramce (GF-016: wspólny default z vtd.defaults; np. gpt-4o-mini)")
+    run_cmd.add_argument("--enrich-model", default=DEFAULT_ENRICH_MODEL, help="Model LLM w bramce (GF-016: wspólny default z vtd.defaults; np. opencode-go/minimax-m3 — szybki, poniżej sufitu 45 s bramki)")
     # Metadane wejściowe — manual-first
     run_cmd.add_argument("--client", type=str, default=None, help="Nazwa klienta (jeśli brak: DO UZUPEŁNIENIA; nie wyciągaj z nazwy pliku)")
     run_cmd.add_argument("--process", type=str, default=None, help="Proces biznesowy (np. Sprzedaż, Produkcja)")

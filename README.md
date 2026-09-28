@@ -163,7 +163,7 @@ llm:
   provider: "openai"
   base_url: "https://api.openai.com/v1"
   api_key_env: "OPENAI_API_KEY"
-  enricher_model: "gpt-4o-mini"
+  enricher_model: "opencode-go/minimax-m3"
   frame_qa_model: "gpt-4o-mini"
 ```
 

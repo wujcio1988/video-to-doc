@@ -198,14 +198,37 @@ def enrich_steps_with_llm(
     ]
 
     try:
-        content = provider.chat_completion(
-            messages=messages,
-            model=chosen_model,
-            temperature=0.2,
-            max_tokens=2500,
-            json_mode=True,
-        )
-        parsed = robust_json_decode(content)
+        def _attempt() -> Optional[Dict[str, Any]]:
+            """Pojedyncza próba wzbogacania; None przy błędzie / pustym wyniku."""
+            try:
+                content = provider.chat_completion(
+                    messages=messages,
+                    model=chosen_model,
+                    temperature=0.2,
+                    max_tokens=8000,
+                    json_mode=True,
+                )
+            except Exception as e:
+                print(f"[OSTRZEŻENIE] Błąd podczas wzbogacania kroków przez LLM: {e}")
+                return None
+            if not content or not str(content).strip():
+                print("[OSTRZEŻENIE] Wzbogacanie LLM: pusty content odpowiedzi (brak treści do sparsowania).")
+                return None
+            try:
+                return robust_json_decode(content)
+            except Exception as e:
+                # R-B: jawny ślad przyczyny zamiast cichego {}.
+                print(f"[OSTRZEŻENIE] Wzbogacanie LLM: błąd parsowania JSON, treść: {str(content)[:200]!r} ({e})")
+                return None
+
+        parsed = _attempt()
+        if not parsed:
+            # R-D: dokładnie 1 automatyczny retry przy None/pustym wyniku (ta sama prośba).
+            print("[OSTRZEŻENIE] Wzbogacanie LLM zwróciło None/pusty wynik — ponawiam próbę (retry 1/1).")
+            parsed = _attempt()
+        if not parsed:
+            print("[OSTRZEŻENIE] Wzbogacanie LLM nie powiodło się po retry — zwracam None.")
+            return None
         return parsed
     except Exception as e:
         print(f"[OSTRZEŻENIE] Błąd podczas wzbogacania kroków przez LLM: {e}")

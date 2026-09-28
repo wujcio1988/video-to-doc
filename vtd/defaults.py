@@ -7,6 +7,6 @@ wyłącznie modele z ALLOWED_MODELS.
 """
 from __future__ import annotations
 
-DEFAULT_ENRICH_MODEL = "gpt-4o-mini"
+DEFAULT_ENRICH_MODEL = "opencode-go/minimax-m3"
 
 __all__ = ["DEFAULT_ENRICH_MODEL"]

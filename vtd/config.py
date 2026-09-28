@@ -17,11 +17,11 @@ class LLMConfig(BaseModel):
     base_url: str = Field(default="https://api.openai.com/v1", description="Adres bazowy API OpenAI-compatible")
     api_key: Optional[str] = Field(default=None, description="Klucz API (opcjonalny, preferowana zmienna środowiskowa)")
     api_key_env: str = Field(default="OPENAI_API_KEY", description="Nazwa zmiennej środowiskowej z kluczem API")
-    timeout: float = Field(default=60.0, description="Timeout zapytań HTTP w sekundach")
+    timeout: float = Field(default=180.0, description="Timeout zapytań HTTP w sekundach")
     max_retries: int = Field(default=3, description="Liczba ponowień przy błędach sieciowych")
 
     # Modele dla poszczególnych ról w pipeline
-    enricher_model: str = Field(default="gpt-4o-mini", description="Model do redagowania i fuzji instrukcji")
+    enricher_model: str = Field(default="opencode-go/minimax-m3", description="Model do redagowania i fuzji instrukcji")
     frame_qa_model: str = Field(default="gpt-4o-mini", description="Model multimodalny do oceny czytelności klatek")
     element_locator_model: str = Field(default="gpt-4o-mini", description="Model do planowania adnotacji UI")
     qa_verifier_model: str = Field(default="gpt-4o-mini", description="Model do weryfikacji jakości dokumentu")
