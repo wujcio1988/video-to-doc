@@ -12,6 +12,7 @@ from vtd.core.transcriber import Transcriber, SpeechSegment
 from vtd.core.frame_extractor import extract_scene_frames
 from vtd.core.dedup import filter_duplicate_frames
 from vtd.core.fusion import fuse_signals_into_steps_v2, validate_steps_timestamps, fuse_signals_into_steps
+from vtd.core.steps_store import save_steps_json
 from vtd.builders.manual_builder import render_markdown_manual, build_llm_prompt, render_clean_transcript, render_docx_manual
 
 # Stała dla Track 3 neutral labeling
@@ -1127,6 +1128,7 @@ def run_pipeline(
                 enriched_data.setdefault("steps", []).append({"step_number": sn, "qa_preview": reason})
 
     # Wstrzyknij adnotacje do enriched_data dla renderers (legenda badge)
+    existing_ann_map: Dict[int, Any] = {}
     if annotations_map:
         if enriched_data is None:
             enriched_data = {"steps": []}
@@ -1168,6 +1170,18 @@ def run_pipeline(
     html_path = output_dir / "INSTRUKCJA.html"
     from vtd.builders.html_builder import render_html_manual
     render_html_manual(title=title, steps=steps, output_html=html_path, enriched_data=enriched_data, metadata=metadata, mode=mode)
+
+    # 4b. R1: kanoniczny snapshot kroków + danych LLM dla `vtd rerender`
+    try:
+        save_steps_json(
+            output_dir=output_dir,
+            steps=steps,
+            enriched_data=enriched_data,
+            annotation_legend=None,
+            existing_ann_map=existing_ann_map,
+        )
+    except Exception as exc:
+        print(f"[OSTRZEŻENIE] Nie udało się zapisać steps.json: {exc}")
 
     # 5. Prompt dla agenta
     prompt_text = build_llm_prompt(steps, module_title=title, mode=mode, metadata=metadata)

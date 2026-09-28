@@ -65,7 +65,7 @@ def test_smoke_run_pipeline_produces_artifacts(video, tmp_path, mocked_env):
     assert len(steps) == 2
     for fname in ("INSTRUKCJA.md", "INSTRUKCJA.html", "INSTRUKCJA.docx", "TRANSKRYPCJA.md",
                   "metadata.json", "manifest.json", "COMPLETENESS_REPORT.md",
-                  "PROMPT_DLA_AGENTA.txt"):
+                  "PROMPT_DLA_AGENTA.txt", "steps.json"):
         assert (out / fname).exists(), f"brakuje artefaktu {fname}"
     assert (out / "client-ready" / "INSTRUKCJA.md").exists()
     metadata = json.loads((out / "metadata.json").read_text(encoding="utf-8"))
@@ -73,6 +73,20 @@ def test_smoke_run_pipeline_produces_artifacts(video, tmp_path, mocked_env):
     assert metadata["document_status"] == "DRAFT"
     manifest = json.loads((out / "manifest.json").read_text(encoding="utf-8"))
     assert manifest["document_status"] == "DRAFT"
+
+
+def test_r1_steps_json_saved_after_run(video, tmp_path, mocked_env):
+    """R1/AC2: po vtd run w output_dir istnieje steps.json z krokami (zapis częściowy bez --enrich)."""
+    out = tmp_path / "out_steps"
+    cli.run_pipeline(video_path=video, output_dir=out, title="T")
+    steps_path = out / "steps.json"
+    assert steps_path.exists()
+    data = json.loads(steps_path.read_text(encoding="utf-8"))
+    assert data["version"] == "1.0"
+    assert [s["step_number"] for s in data["steps"]] == [1, 2]
+    assert data["enriched_data"] is None, "bez --enrich zapis częściowy: enriched_data=null"
+    assert all(not Path(s["frame_path"]).is_absolute() for s in data["steps"]), \
+        "frame_path w steps.json musi być względny (przenośność)"
 
 
 def test_gf025_regression_missing_video_raises_pipeline_error(tmp_path):

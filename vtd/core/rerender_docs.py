@@ -21,8 +21,13 @@ from pathlib import Path
 from typing import List, Optional, Dict, Any
 
 from vtd.core.fusion import ManualStep
-from vtd.builders.manual_builder import render_markdown_manual
+from vtd.builders.manual_builder import render_markdown_manual, render_docx_manual
 from vtd.builders.html_builder import render_html_manual
+from vtd.core.steps_store import (
+    load_steps_json,
+    steps_json_to_manual_steps,
+    steps_json_to_enriched,
+)
 
 
 def _timestamp() -> str:
@@ -230,28 +235,46 @@ def rerender_output_dir(output_dir: Path) -> Dict[str, Any]:
     metadata = _load_metadata(output_dir)
     title = metadata.get("title") or output_dir.name
     mode = metadata.get("mode") or "manual"
-    # Try reconstruction in order: prompt > existing md > frames
     steps: List[ManualStep] = []
     enriched_data: Optional[Dict[str, Any]] = None
     parsed_enriched: Dict[int, Dict[str, str]] = {}
 
-    # 1. prompt
-    steps = _parse_steps_from_prompt(output_dir)
-    if steps:
-        # also try to get titles from existing md for enriched
-        _, parsed_enriched = _parse_steps_from_existing_markdown(output_dir)
-        if parsed_enriched:
-            enriched_data = _load_enriched_from_old(output_dir, parsed_enriched)
-    # 2. existing md if prompt gave nothing
-    if not steps:
-        steps, parsed_enriched = _parse_steps_from_existing_markdown(output_dir)
-        if parsed_enriched:
-            enriched_data = _load_enriched_from_old(output_dir, parsed_enriched)
-    # 3. frames fallback
-    if not steps:
-        steps = _parse_steps_from_frames(output_dir)
+    # R1: steps.json jest kanonicznym, samowystarczalnym źródłem (ManualStep + enriched_data).
+    # Używamy go, gdy istnieje i zawiera kroki; inaczej backward compat z rekonstrukcji.
+    _data = load_steps_json(output_dir)
+    _from_steps_json = False
+    if _data is not None:
+        steps = steps_json_to_manual_steps(_data)
+        if steps:
+            enriched_data = steps_json_to_enriched(_data)
+            # R2: frame_path zapisane względnie — odbuduj absolutne ścieżki dla builderów
+            for _s in steps:
+                if not _s.frame_path.is_absolute():
+                    _s.frame_path = output_dir / _s.frame_path
+                _s.grid_frames = [
+                    (g if g.is_absolute() else output_dir / g) for g in _s.grid_frames
+                ]
+            _from_steps_json = True
+
+    if not _from_steps_json:
+        # Try reconstruction in order: prompt > existing md > frames
+        # 1. prompt
+        steps = _parse_steps_from_prompt(output_dir)
+        if steps:
+            # also try to get titles from existing md for enriched
+            _, parsed_enriched = _parse_steps_from_existing_markdown(output_dir)
+            if parsed_enriched:
+                enriched_data = _load_enriched_from_old(output_dir, parsed_enriched)
+        # 2. existing md if prompt gave nothing
         if not steps:
-            raise RuntimeError(f"No steps reconstructable in {output_dir} (no prompt, no markdown, no frames)")
+            steps, parsed_enriched = _parse_steps_from_existing_markdown(output_dir)
+            if parsed_enriched:
+                enriched_data = _load_enriched_from_old(output_dir, parsed_enriched)
+        # 3. frames fallback
+        if not steps:
+            steps = _parse_steps_from_frames(output_dir)
+            if not steps:
+                raise RuntimeError(f"No steps reconstructable in {output_dir} (no prompt, no markdown, no frames)")
 
     # If still no enriched, try to keep previous enriched titles by re-parsing prompt speech?
     # Ensure steps sorted and have correct frame_path absolute
@@ -296,7 +319,32 @@ def rerender_output_dir(output_dir: Path) -> Dict[str, Any]:
             cr.parent.mkdir(parents=True, exist_ok=True)
             cr.write_text(content, encoding="utf-8")
 
-    return {"output_dir": str(output_dir), "steps": len(steps), "backups": backups, "title": title, "mode": mode}
+    # R3: DOCX (z backupem i kopią do client-ready)
+    output_docx = output_dir / "INSTRUKCJA.docx"
+    if output_docx.exists():
+        # backup w schemacie INSTRUKCJA.bak.<ts>.docx (AC7)
+        ts = _timestamp()
+        bak_docx = output_docx.with_name(f"{output_docx.stem}.bak.{ts}{output_docx.suffix}")
+        counter = 0
+        while bak_docx.exists():
+            counter += 1
+            bak_docx = output_docx.with_name(f"{output_docx.stem}.bak.{ts}.{counter}{output_docx.suffix}")
+        shutil.copy2(output_docx, bak_docx)
+        backups[str(output_docx)] = str(bak_docx)
+    render_docx_manual(
+        title=title,
+        steps=steps,
+        output_docx=output_docx,
+        intro=(enriched_data or {}).get("intro", "") if enriched_data else "",
+        enriched_data=enriched_data,
+        metadata=metadata,
+        mode=mode,
+    )
+    client_ready = output_dir / "client-ready"
+    if client_ready.is_dir() and output_docx.exists():
+        shutil.copy2(output_docx, client_ready / output_docx.name)
+
+    return {"output_dir": str(output_dir), "steps": len(steps), "backups": backups, "title": title, "mode": mode, "docx": str(output_docx)}
 
 
 def main():

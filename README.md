@@ -236,7 +236,7 @@ Studio security: if `VTD_AUTH_TOKEN` is set (required in Docker), all endpoints 
 - **AI annotations** (`--annotate`): OCR TSV locating of key UI elements, drawing focus arrows, boxes and numbered badges into a separate non-destructive directory.
 - **Image enhancement** (`--nano-banana`, experimental): Gemini/OmniRoute-based frame upscaling of selected frames, with `--nano-auto-accept` to auto-accept.
 - **Output mode** (`--output-mode`): `both` (default) copies documents/frames to internal and client-ready locations; `internal` / `client-ready` restrict the manifest accordingly.
-- **Rerender** (`vtd rerender`): Regenerate MD/HTML/DOCX documents from an existing `metadata.json` without re-running the whole pipeline.
+- **Rerender** (`vtd rerender`): Regenerate MD/HTML/DOCX documents from an existing output folder without re-running the whole pipeline. It prefers `steps.json` (canonical step + LLM snapshot written by `vtd run`) and falls back to `metadata.json` / `PROMPT_DLA_AGENTA.txt` / `INSTRUKCJA.md` for older outputs.
 - **Watchdog**: Optional crash-recovery watchdog for long runs (see `AUDYT_KODU.md` for known limitations).
 - **QA verifier**: Manifest-based post-run consistency checks documented in `COMPLETENESS_REPORT.md`.
 - **Studio settings page**: Editable pipeline defaults persisted in the local settings store.
